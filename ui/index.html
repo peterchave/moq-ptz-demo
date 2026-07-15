@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PTZ Camera over MOQT</title>
+  <style>
+    :root {
+      --bg: #07111f;
+      --bg-elevated: rgba(15, 26, 43, 0.92);
+      --bg-panel: rgba(10, 18, 31, 0.86);
+      --line: rgba(131, 169, 214, 0.18);
+      --text: #e8f2ff;
+      --muted: #91a8c4;
+      --accent: #53d3ff;
+      --accent-strong: #1fb6ff;
+      --accent-warm: #ffb44f;
+      --success: #4ade80;
+      --shadow: 0 20px 50px rgba(0, 0, 0, 0.38);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "SF Pro Display", "Helvetica Neue", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(31, 182, 255, 0.22), transparent 28%),
+        radial-gradient(circle at top right, rgba(255, 180, 79, 0.18), transparent 22%),
+        linear-gradient(180deg, #081221 0%, #030712 100%);
+    }
+
+    .page {
+      width: min(1360px, calc(100% - 32px));
+      margin: 24px auto 48px;
+      display: grid;
+      gap: 24px;
+    }
+
+    .hero,
+    .panel,
+    .diagram,
+    .log-panel {
+      border: 1px solid var(--line);
+      background: var(--bg-elevated);
+      backdrop-filter: blur(22px);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      padding: 24px 28px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .eyebrow {
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      font-size: 0.74rem;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.8rem, 3vw, 3rem);
+      line-height: 1;
+      letter-spacing: -0.04em;
+      max-width: none;
+      white-space: nowrap;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: none;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.6;
+    }
+
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .meta-pill {
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(83, 211, 255, 0.18);
+      background: rgba(83, 211, 255, 0.08);
+      color: #d8f6ff;
+      font-size: 0.86rem;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 16px;
+      cursor: pointer;
+      font: inherit;
+      transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+    }
+
+    button:hover { transform: translateY(-1px); }
+    button:active { transform: translateY(1px); }
+    button:disabled { opacity: 0.55; cursor: wait; transform: none; }
+
+    .primary-action,
+    .secondary-action {
+      min-width: 180px;
+      padding: 14px 18px;
+      font-size: 1rem;
+      font-weight: 700;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+    }
+
+    .primary-action {
+      color: #02131f;
+      background: linear-gradient(135deg, #86efff 0%, #2dbfff 100%);
+    }
+
+    .secondary-action {
+      color: var(--text);
+      background: linear-gradient(135deg, rgba(255, 180, 79, 0.95), rgba(255, 118, 61, 0.9));
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.85fr) minmax(320px, 0.95fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    .panel {
+      padding: 22px;
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .panel-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    #stats {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+
+    .video-frame {
+      position: relative;
+      overflow: hidden;
+      border-radius: 20px;
+      border: 1px solid rgba(131, 169, 214, 0.14);
+      background:
+        linear-gradient(180deg, rgba(31, 182, 255, 0.05), rgba(3, 7, 18, 0.16)),
+        #000;
+    }
+
+    canvas {
+      width: 100%;
+      display: block;
+      max-width: 100%;
+      background: #000;
+      aspect-ratio: 16 / 9;
+      object-fit: contain;
+    }
+
+    .video-badge {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(2, 10, 18, 0.72);
+      border: 1px solid rgba(83, 211, 255, 0.2);
+      color: #d7f4ff;
+      font-size: 0.8rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .controls-card {
+      display: grid;
+      gap: 18px;
+    }
+
+    .controls-copy {
+      color: var(--muted);
+      font-size: 0.94rem;
+      line-height: 1.5;
+    }
+
+    .ptz-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .ptz-btn,
+    .preset-btn {
+      min-height: 68px;
+      padding: 12px;
+      background: linear-gradient(180deg, rgba(14, 28, 47, 0.92), rgba(7, 15, 28, 0.96));
+      color: var(--text);
+      border: 1px solid rgba(131, 169, 214, 0.16);
+    }
+
+    .ptz-btn strong,
+    .preset-btn strong {
+      display: block;
+      font-size: 1.15rem;
+      letter-spacing: 0.02em;
+    }
+
+    .ptz-btn span,
+    .preset-btn span {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .ptz-btn--center {
+      background: radial-gradient(circle, rgba(83, 211, 255, 0.18), rgba(10, 18, 31, 0.96));
+      color: var(--accent);
+    }
+
+    .zoom-row,
+    .preset-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .section-label {
+      margin: 0 0 8px;
+      font-size: 0.8rem;
+      color: var(--accent-warm);
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .diagram {
+      padding: 22px;
+      overflow: hidden;
+    }
+
+    .diagram h2,
+    .controls-card h2,
+    .log-panel h2 {
+      margin: 0 0 10px;
+      font-size: 1.15rem;
+      letter-spacing: 0.01em;
+    }
+
+    .diagram p,
+    .log-panel p {
+      margin: 0 0 18px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .simple-flow {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1.35fr) auto minmax(0, 1.15fr);
+      gap: 10px;
+      align-items: center;
+    }
+
+    .simple-node {
+      min-height: 116px;
+      padding: 16px 18px;
+      border-radius: 14px;
+      border: 1px solid rgba(131, 169, 214, 0.24);
+      background: rgba(7, 15, 28, 0.72);
+    }
+
+    .simple-node strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 0.9rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .simple-node span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.5;
+    }
+
+    .simple-node code {
+      color: var(--accent);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82rem;
+    }
+
+    .simple-node--warm {
+      border-color: rgba(255, 180, 79, 0.34);
+      background: rgba(28, 18, 8, 0.78);
+    }
+
+    .simple-arrow {
+      display: grid;
+      place-items: center;
+      min-width: 88px;
+      color: var(--accent-warm);
+      font-weight: 700;
+      text-align: center;
+      font-size: 0.72rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    .simple-arrow::after {
+      content: "→";
+      display: block;
+      margin-top: 4px;
+      color: rgba(255, 180, 79, 0.95);
+      font-size: 2rem;
+      letter-spacing: 0;
+    }
+
+    .simple-arrow--bidirectional::after {
+      content: "↔";
+    }
+
+    .camera-links {
+      display: grid;
+      gap: 14px;
+      align-content: center;
+    }
+
+    .camera-link {
+      display: grid;
+      justify-items: center;
+      color: var(--accent-warm);
+      font-weight: 700;
+      text-align: center;
+      font-size: 0.72rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    .camera-link::after {
+      display: block;
+      margin-top: 4px;
+      color: rgba(255, 180, 79, 0.95);
+      font-size: 2rem;
+      letter-spacing: 0;
+    }
+
+    .camera-link--forward::after {
+      content: "→";
+    }
+
+    .camera-link--reverse::after {
+      content: "←";
+    }
+
+    .log-panel {
+      padding: 22px;
+    }
+
+    pre {
+      margin: 0;
+      background: var(--bg-panel);
+      color: #d7e9ff;
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(131, 169, 214, 0.12);
+      font-size: 0.85rem;
+      max-height: 40vh;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1080px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      .simple-flow {
+        grid-template-columns: 1fr;
+      }
+
+      .simple-arrow,
+      .camera-link {
+        min-width: 0;
+        padding: 4px 0;
+      }
+
+      .simple-arrow::after,
+      .camera-link::after {
+        content: "↓";
+        margin-top: 6px;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .page {
+        width: min(100% - 18px, 1360px);
+        margin: 12px auto 28px;
+      }
+
+      .hero,
+      .panel,
+      .diagram,
+      .log-panel {
+        border-radius: 20px;
+      }
+
+      .hero-actions {
+        flex-direction: column;
+      }
+
+      .primary-action,
+      .secondary-action {
+        width: 100%;
+      }
+
+      h1 {
+        white-space: normal;
+      }
+    }
+  </style>
+</head>
+<body>
+<main class="page">
+  <section class="hero">
+    <div class="eyebrow">OpenMOQ Demo</div>
+    <h1>PTZ camera monitoring over MOQT</h1>
+    <p>Live video travels forward over WebTransport and LOC into WebCodecs, while a separate PTZ control lane pushes camera moves back toward the adaptor and physical camera control API.</p>
+    <!--<div class="hero-meta">
+      <div class="meta-pill">Dark-mode operations console</div>
+      <div class="meta-pill">Video over LOC</div>
+      <div class="meta-pill">PTZ control over MOQT objects</div>
+    </div>-->
+    <div class="hero-actions">
+      <button id="start" class="primary-action">Start Live Stream</button>
+      <button id="start-controls" class="secondary-action">Arm PTZ Controls</button>
+    </div>
+  </section>
+
+  <section class="layout">
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Live Monitor</div>
+        <div id="stats">Video: 0 frames | Audio: 0 chunks</div>
+      </div>
+      <div class="video-frame">
+        <div class="video-badge">WT → MOQT → LOC → WebCodecs</div>
+        <canvas id="canvas" width="1920" height="1080"></canvas>
+      </div>
+    </section>
+
+    <aside class="panel controls-card">
+      <div>
+        <h2>PTZ Controls</h2>
+       <!-- <p class="controls-copy">On-screen controls send atomic PTZ commands over the control namespace. Each press emits one bounded movement or preset recall; no keyboard bindings are used.</p> -->
+      </div>
+
+      <div>
+        <p class="section-label">Pan / Tilt</p>
+        <div class="ptz-grid">
+          <div></div>
+          <button class="ptz-btn" data-ptz-action="move" data-ptz-axis="tilt" data-ptz-value="0.4">
+            <strong>↑</strong>
+            <span>Tilt Up</span>
+          </button>
+          <div></div>
+
+          <button class="ptz-btn" data-ptz-action="move" data-ptz-axis="pan" data-ptz-value="-0.4">
+            <strong>←</strong>
+            <span>Pan Left</span>
+          </button>
+          <button class="ptz-btn ptz-btn--center" type="button" disabled>
+            <strong>PTZ</strong>
+            <span>Atomic 300ms</span>
+          </button>
+          <button class="ptz-btn" data-ptz-action="move" data-ptz-axis="pan" data-ptz-value="0.4">
+            <strong>→</strong>
+            <span>Pan Right</span>
+          </button>
+
+          <div></div>
+          <button class="ptz-btn" data-ptz-action="move" data-ptz-axis="tilt" data-ptz-value="-0.4">
+            <strong>↓</strong>
+            <span>Tilt Down</span>
+          </button>
+          <div></div>
+        </div>
+      </div>
+
+      <div>
+        <p class="section-label">Zoom</p>
+        <div class="zoom-row">
+          <button class="ptz-btn" data-ptz-action="move" data-ptz-axis="zoom" data-ptz-value="0.2">
+            <strong>+</strong>
+            <span>Zoom In</span>
+          </button>
+          <button class="ptz-btn" data-ptz-action="move" data-ptz-axis="zoom" data-ptz-value="-0.2">
+            <strong>−</strong>
+            <span>Zoom Out</span>
+          </button>
+          <button class="ptz-btn" data-ptz-action="preset" data-ptz-preset="4">
+            <strong>◎</strong>
+            <span>Home Preset</span>
+          </button>
+        </div>
+      </div>
+
+      <div>
+        <p class="section-label">Presets</p>
+        <div class="preset-row">
+          <button class="preset-btn" data-ptz-action="preset" data-ptz-preset="1">
+            <strong>P1</strong>
+            <span>Entry</span>
+          </button>
+          <button class="preset-btn" data-ptz-action="preset" data-ptz-preset="2">
+            <strong>P2</strong>
+            <span>Stage</span>
+          </button>
+          <button class="preset-btn" data-ptz-action="preset" data-ptz-preset="3">
+            <strong>P3</strong>
+            <span>Audience</span>
+          </button>
+        </div>
+      </div>
+    </aside>
+  </section>
+
+  <section class="diagram">
+    <h2>End-to-End Flow</h2>
+    <p>RTSP flows to the adaptor. PTZ commands flow back to the camera over a separate API path.</p>
+    <div class="simple-flow">
+      <div class="simple-node">
+        <strong>Browser</strong>
+        <span>Subscribes to live media.</span>
+        <span>Sends PTZ control objects.</span>
+      </div>
+      <div class="simple-arrow simple-arrow--bidirectional">MOQT</div>
+      <div class="simple-node">
+        <strong>Relay</strong>
+        <span>Routes media and control traffic.</span>
+      </div>
+      <div class="simple-arrow simple-arrow--bidirectional">MOQT</div>
+      <div class="simple-node">
+        <strong>MOQT Adaptor</strong>
+        <span>Publishes media.</span>
+        <span>Maps control objects to <code>ptz-cam-1/*</code>.</span>
+      </div>
+      <div class="camera-links">
+        <div class="camera-link camera-link--reverse">RTSP</div>
+        <div class="camera-link camera-link--forward">PTZ API</div>
+      </div>
+      <div class="simple-node simple-node--warm">
+        <strong>PTZ Camera</strong>
+        <span>Video source.</span>
+        <span>Receives pan, tilt, zoom commands.</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="log-panel">
+    <h2>Runtime Log</h2>
+    <p>Control-session events, relay subscriptions, and media decode state are captured here for debugging.</p>
+    <pre id="log"></pre>
+  </section>
+</main>
+<script type="module" src="main.ts"></script>
+</body>
+</html>
