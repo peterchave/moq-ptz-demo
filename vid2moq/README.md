@@ -7,20 +7,21 @@ Publishes a camera RTSP video stream into MOQT.
 - Pipes the stream into `media_send`.
 - Publishes to a MOQT relay/namespace/track.
 
-## Prerequisite: local moq5 checkout
-This project links against prebuilt libraries from a local `moq5` repository.
+## Prerequisite: moq5 + picoquic
 
-If you do not already have one:
-```sh
-git clone https://github.com/openmoq/moq5
-```
+This project links against prebuilt libraries from [moq5](https://github.com/openmoq/moq5)
+with its picoquic adapter. picoquic is **not bundled** in moq5 — clone it separately.
 
-By default, this project expects moq5 at `/Users/pchave/Documents/Alpha/MoQ/ptz-demo/moq5`.
-If your checkout is elsewhere, pass `-DMOQ5_ROOT=/path/to/moq5` when running cmake.
+Complete these steps: [moq5 install](../MOQ5_INSTALL.md)
 
 ## Build
 ```sh
 ./build.sh
+```
+
+To rebuild from scratch:
+```sh
+./build.sh clean
 ```
 
 ## Configure

@@ -14,12 +14,19 @@
  *   --height N               video height metadata (default 0)
  *   --framerate N            catalog framerate override (default fps)
  *   --bitrate N              max bitrate bits/s (default 1500000)
+ *   --catalog-keepalive-ms N catalog refresh interval in ms (0 disables)
+ *   --pipe ...               optional extra video tracks from named pipes
+ *   --keyframe-track <name>  optional keyframe-only sidecar track
  */
 
 #include <moq/endpoint.h>
 #include <moq/media_sender.h>
 #include <moq/rcbuf.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -30,6 +37,19 @@
 
 static volatile sig_atomic_t g_stop = 0;
 enum { ENDPOINT_DRAIN_TIMEOUT_US = 5000000 };
+
+/* ── Extra-track definitions ─────────────────────────────────────────── */
+
+#define MAX_EXTRA_TRACKS 8
+
+typedef struct {
+    const char *name;
+    const char *path;
+    uint32_t    width;
+    uint32_t    height;
+    uint32_t    fps;
+    uint64_t    bitrate;
+} extra_def_t;
 
 static void on_signal(int sig)
 {
@@ -103,8 +123,17 @@ static bool ensure_bytes(FILE *in, byte_vec_t *buf, size_t need)
     uint8_t tmp[4096];
     while (!g_stop && buf->len < need) {
         size_t n = fread(tmp, 1, sizeof(tmp), in);
-        if (n == 0)
+        if (n == 0) {
+            /* For optional FIFO tracks opened O_NONBLOCK, "no data yet" is
+               surfaced as EAGAIN/EWOULDBLOCK. Keep polling so the thread does
+               not exit before the writer starts, and so Ctrl-C can break out. */
+            if (ferror(in) && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                clearerr(in);
+                usleep(10000);
+                continue;
+            }
             return false;
+        }
         if (!vec_append(buf, tmp, n))
             return false;
     }
@@ -335,17 +364,123 @@ static uint64_t realtime_time_us(void)
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000ull);
 }
 
+/* ── Named-pipe reader thread ────────────────────────────────────────── */
+
+typedef struct {
+    moq_media_sender_t *tx;
+    moq_media_track_t  *track;
+    const char         *name;
+    const char         *path;
+    uint32_t            fps;
+} pipe_track_t;
+
+static void *pipe_track_reader(void *arg)
+{
+    pipe_track_t *pt = (pipe_track_t *)arg;
+    /* Open the FIFO without blocking so Ctrl-C can always escape.
+     * fopen(O_RDONLY) on a FIFO blocks until a writer appears, which
+     * makes pthread_join hang if the writer never opens (e.g. ffmpeg
+     * exited with an error).  Use O_NONBLOCK to poll instead. */
+    int _fd = -1;
+    while (!g_stop) {
+        _fd = open(pt->path, O_RDONLY | O_NONBLOCK);
+        if (_fd >= 0) break;
+        if (errno == ENXIO || errno == ENOENT) {
+            /* No writer yet (ENXIO on macOS/Linux for FIFO w/o writer) */
+            usleep(100000);
+            continue;
+        }
+        fprintf(stderr, "track '%s': open '%s': %s\n",
+                pt->name, pt->path, strerror(errno));
+        return NULL;
+    }
+    if (_fd < 0) return NULL;  /* g_stop was set before writer appeared */
+
+    FILE *in = fdopen(_fd, "rb");
+    if (!in) {
+        close(_fd);
+        fprintf(stderr, "track '%s': fdopen '%s': %s\n",
+                pt->name, pt->path, strerror(errno));
+        return NULL;
+    }
+
+    h264_annexb_reader_t reader;
+    h264_reader_init(&reader);
+    byte_vec_t au = {0};
+    uint64_t frame_index = 0;
+    bool started = false;
+    const uint64_t frame_dur = pt->fps ? 1000000ull / pt->fps : 33333ull;
+
+    while (!g_stop) {
+        bool keyframe = false;
+        if (!read_h264_access_unit(in, &reader, &au, &keyframe))
+            break;
+        if (au.len == 0)
+            continue;
+        if (!started) {
+            if (!keyframe)
+                continue;
+            started = true;
+            fprintf(stderr, "track '%s': first keyframe; starting publish\n", pt->name);
+        }
+
+        uint8_t *owned = (uint8_t *)malloc(au.len);
+        if (!owned)
+            break;
+        memcpy(owned, au.data, au.len);
+
+        moq_rcbuf_t *payload = NULL;
+        if (moq_rcbuf_wrap(moq_alloc_default(), owned, au.len,
+                           payload_release, NULL, &payload) != MOQ_OK) {
+            free(owned);
+            break;
+        }
+
+        moq_media_send_object_t o;
+        memset(&o, 0, sizeof(o));
+        o.struct_size          = sizeof(o);
+        o.payload              = payload;
+        o.is_sync              = keyframe;
+        o.starts_group         = keyframe;
+        o.presentation_time_us = frame_index * frame_dur;
+        o.decode_time_us       = frame_index * frame_dur;
+        o.has_capture_time     = true;
+        o.capture_time_us      = realtime_time_us();
+
+        moq_result_t wr = moq_media_sender_write(pt->tx, pt->track, &o);
+        if (wr == MOQ_OK) {
+            frame_index++;
+        } else if (wr == MOQ_ERR_WOULD_BLOCK) {
+            moq_rcbuf_decref(payload);
+        } else {
+            moq_rcbuf_decref(payload);
+            if (wr != MOQ_ERR_INTERRUPTED && wr != MOQ_ERR_CLOSED)
+                fprintf(stderr, "track '%s' write failed: %d\n", pt->name, (int)wr);
+            break;
+        }
+    }
+
+    fclose(in);
+    h264_reader_free(&reader);
+    vec_free(&au);
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s <url> <namespace> [track] [options]\n"
-                "  --insecure-skip-verify   disable TLS certificate verification\n"
-                "  --fps N                  frame rate (default 30)\n"
-                "  --width N                video width in pixels (default 0)\n"
-                "  --height N               video height in pixels (default 0)\n"
-                "  --framerate N            catalog framerate override (default fps)\n"
-                "  --bitrate N              max bitrate bits/s (default 1500000)\n",
+                "  --insecure-skip-verify        disable TLS certificate verification\n"
+                "  --fps N                       frame rate (default 30)\n"
+                "  --width N                     video width in pixels (default 0)\n"
+                "  --height N                    video height in pixels (default 0)\n"
+                "  --framerate N                 catalog framerate override (default fps)\n"
+                "  --bitrate N                   max bitrate bits/s (default 1500000)\n"
+                "  --catalog-keepalive-ms N      catalog refresh interval in ms (0 disables)\n"
+                "  --pipe <name> <path> <w> <h> <fps> <bps>\n"
+                "                                extra track from named pipe\n"
+                "  --keyframe-track <name>       sidecar track: keyframes from stdin source\n",
                 argv[0]);
         return 2;
     }
@@ -363,6 +498,13 @@ int main(int argc, char **argv)
     uint32_t height = 0;
     uint32_t framerate = 0;
     uint64_t bitrate = 1500000;
+    bool has_catalog_keepalive_ms = false;
+    uint64_t catalog_keepalive_ms = 0;
+
+    extra_def_t  extra_defs[MAX_EXTRA_TRACKS];
+    int          n_extra       = 0;
+    const char  *kf_track_name = NULL;
+    bool         track_set     = false;
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--insecure-skip-verify") == 0)
@@ -377,8 +519,34 @@ int main(int argc, char **argv)
             framerate = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc)
             bitrate = (uint64_t)strtoull(argv[++i], NULL, 10);
-        else
+        else if (strcmp(argv[i], "--catalog-keepalive-ms") == 0 && i + 1 < argc) {
+            catalog_keepalive_ms = (uint64_t)strtoull(argv[++i], NULL, 10);
+            has_catalog_keepalive_ms = true;
+        }
+        else if (strcmp(argv[i], "--pipe") == 0 && i + 6 < argc) {
+            if (n_extra < MAX_EXTRA_TRACKS) {
+                extra_defs[n_extra].name    = argv[i + 1];
+                extra_defs[n_extra].path    = argv[i + 2];
+                extra_defs[n_extra].width   = (uint32_t)strtoul (argv[i + 3], NULL, 10);
+                extra_defs[n_extra].height  = (uint32_t)strtoul (argv[i + 4], NULL, 10);
+                extra_defs[n_extra].fps     = (uint32_t)strtoul (argv[i + 5], NULL, 10);
+                extra_defs[n_extra].bitrate = (uint64_t)strtoull(argv[i + 6], NULL, 10);
+                n_extra++;
+                i += 6;
+            }
+        }
+        else if (strcmp(argv[i], "--keyframe-track") == 0 && i + 1 < argc)
+            kf_track_name = argv[++i];
+        else if (argv[i][0] == '-' && argv[i][1] == '-') {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return 2;
+        } else if (!track_set) {
             track = argv[i];
+            track_set = true;
+        } else {
+            fprintf(stderr, "unexpected positional arg: %s\n", argv[i]);
+            return 2;
+        }
     }
 
     if (fps == 0)
@@ -400,10 +568,14 @@ int main(int argc, char **argv)
     }
 
     moq_media_sender_cfg_t scfg;
-    moq_media_sender_cfg_init_live(&scfg);
+    moq_media_sender_cfg_init_live_sized(&scfg, sizeof(scfg));
     scfg.endpoint = NULL;
     scfg.namespace_.parts = ns_parts;
     scfg.namespace_.count = ns_count;
+    if (has_catalog_keepalive_ms) {
+        scfg.catalog_refresh_interval_us =
+            catalog_keepalive_ms == 0 ? UINT64_MAX : (catalog_keepalive_ms * 1000ull);
+    }
 
     moq_media_sender_t *tx = NULL;
     rc = moq_media_sender_attach(ep, &scfg, &tx);
@@ -439,6 +611,76 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "annex-b stdin ingest enabled (fps=%u)\n", fps);
+
+    /* ── Extra pipe tracks ──────────────────────────────────────────── */
+
+    pipe_track_t pipe_tracks[MAX_EXTRA_TRACKS];
+    pthread_t    threads[MAX_EXTRA_TRACKS];
+    int          n_threads = 0;
+
+    for (int e = 0; e < n_extra; e++) {
+        moq_media_track_cfg_t etc;
+        moq_media_track_cfg_init(&etc);
+        etc.name.data        = (const uint8_t *)extra_defs[e].name;
+        etc.name.len         = strlen(extra_defs[e].name);
+        etc.media_type       = MOQ_MEDIA_TYPE_VIDEO;
+        etc.packaging        = MOQ_MEDIA_PACKAGING_RAW;
+        etc.codec.data       = (const uint8_t *)"avc1.42e01e";
+        etc.codec.len        = 11;
+        etc.bitrate          = extra_defs[e].bitrate ? extra_defs[e].bitrate : bitrate;
+        etc.width            = extra_defs[e].width;
+        etc.height           = extra_defs[e].height;
+        uint32_t efps        = extra_defs[e].fps ? extra_defs[e].fps : fps;
+        etc.framerate_millis = (uint64_t)efps * 1000u;
+        etc.is_live          = true;
+
+        moq_media_track_t *etrk = NULL;
+        rc = moq_media_sender_add_track(tx, &etc, &etrk);
+        if (rc != MOQ_OK) {
+            fprintf(stderr, "add_track '%s' failed: %d\n", extra_defs[e].name, (int)rc);
+            moq_media_sender_destroy(tx);
+            moq_endpoint_stop(ep);
+            moq_endpoint_destroy(ep);
+            return 1;
+        }
+
+        pipe_tracks[n_threads].tx    = tx;
+        pipe_tracks[n_threads].track = etrk;
+        pipe_tracks[n_threads].name  = extra_defs[e].name;
+        pipe_tracks[n_threads].path  = extra_defs[e].path;
+        pipe_tracks[n_threads].fps   = efps;
+        pthread_create(&threads[n_threads], NULL, pipe_track_reader,
+                       &pipe_tracks[n_threads]);
+        n_threads++;
+        fprintf(stderr, "track '%s': reader thread started (pipe: %s)\n",
+                extra_defs[e].name, extra_defs[e].path);
+    }
+
+    /* ── Keyframe sidecar track ─────────────────────────────────────── */
+
+    moq_media_track_t *kf_track = NULL;
+    if (kf_track_name) {
+        moq_media_track_cfg_t kftc;
+        moq_media_track_cfg_init(&kftc);
+        kftc.name.data        = (const uint8_t *)kf_track_name;
+        kftc.name.len         = strlen(kf_track_name);
+        kftc.media_type       = MOQ_MEDIA_TYPE_VIDEO;
+        kftc.packaging        = MOQ_MEDIA_PACKAGING_RAW;
+        kftc.codec.data       = (const uint8_t *)"avc1.42e01e";
+        kftc.codec.len        = 11;
+        kftc.bitrate          = bitrate;
+        kftc.width            = width;
+        kftc.height           = height;
+        kftc.framerate_millis = 0;   /* variable — keyframes only */
+        kftc.is_live          = true;
+        rc = moq_media_sender_add_track(tx, &kftc, &kf_track);
+        if (rc != MOQ_OK) {
+            fprintf(stderr, "add_track '%s' failed: %d\n", kf_track_name, (int)rc);
+            kf_track = NULL;
+        } else {
+            fprintf(stderr, "track '%s': keyframe sidecar active\n", kf_track_name);
+        }
+    }
     const uint64_t frame_duration_us = 1000000ull / fps;
     uint64_t frame_index = 0;
     unsigned long long sent = 0;
@@ -485,24 +727,53 @@ int main(int argc, char **argv)
         o.has_capture_time = true;
         o.capture_time_us = realtime_time_us();
 
+        /* Keyframe sidecar: incref before the first write so the same
+           buffer can be handed to both tracks without an extra malloc. */
+        bool write_kf = (keyframe && kf_track != NULL);
+        if (write_kf)
+            moq_rcbuf_incref(payload);
+
         moq_result_t wr = moq_media_sender_write(tx, trk, &o);
         if (wr == MOQ_OK) {
             sent++;
             frame_index++;
         } else if (wr == MOQ_ERR_WOULD_BLOCK) {
             moq_rcbuf_decref(payload);
+            if (write_kf) { moq_rcbuf_decref(payload); write_kf = false; }
         } else if (wr == MOQ_ERR_INTERRUPTED || wr == MOQ_ERR_CLOSED) {
             moq_rcbuf_decref(payload);
+            if (write_kf) { moq_rcbuf_decref(payload); write_kf = false; }
             break;
         } else {
             moq_rcbuf_decref(payload);
+            if (write_kf) { moq_rcbuf_decref(payload); write_kf = false; }
             fprintf(stderr, "write failed: %d\n", (int)wr);
             break;
+        }
+
+        if (write_kf) {
+            moq_media_send_object_t kfo;
+            memset(&kfo, 0, sizeof(kfo));
+            kfo.struct_size          = sizeof(kfo);
+            kfo.payload              = payload;   /* ref held from incref above */
+            kfo.is_sync              = true;
+            kfo.starts_group         = true;
+            kfo.presentation_time_us = o.presentation_time_us;
+            kfo.decode_time_us       = o.decode_time_us;
+            kfo.has_capture_time     = true;
+            kfo.capture_time_us      = o.capture_time_us;
+            moq_result_t wkf = moq_media_sender_write(tx, kf_track, &kfo);
+            if (wkf != MOQ_OK)
+                moq_rcbuf_decref(payload);
         }
     }
 
     vec_free(&au);
     h264_reader_free(&reader);
+
+    /* Join extra-track reader threads */
+    for (int i = 0; i < n_threads; i++)
+        pthread_join(threads[i], NULL);
 
     fprintf(stderr, "wrote %llu objects\n", sent);
 

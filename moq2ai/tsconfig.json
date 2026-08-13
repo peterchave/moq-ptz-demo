@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@moqt/transport":    ["../ui/packages/transport/src/index.ts"],
+      "@moqt/webtransport": ["../ui/packages/webtransport/src/index.ts"],
+      "@moqt/msf":          ["../ui/packages/msf/src/index.ts"],
+      "@moqt/loc":          ["../ui/packages/loc/src/index.ts"]
+    }
+  },
+  "include": ["*.ts"]
+}

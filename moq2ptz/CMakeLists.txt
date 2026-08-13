@@ -10,10 +10,12 @@ project(moq2ptz C)
 # Override on the cmake command line if your layout differs:
 #   cmake -B build -DMOQ5_ROOT=/path/to/moq5
 #
-set(MOQ5_ROOT  "/Users/pchave/Documents/Alpha/MoQ/ptz-demo/moq5"
+set(MOQ5_ROOT  "${CMAKE_CURRENT_SOURCE_DIR}/../moq5"
     CACHE PATH "moq5 repository root")
 set(MOQ5_BUILD "${MOQ5_ROOT}/build"
     CACHE PATH "moq5 CMake build directory")
+set(MOQ5_PTLS_BUILD "${MOQ5_ROOT}/thirdparty/picotls/build"
+    CACHE PATH "picotls build directory (adjacent to moq5/thirdparty/picoquic)")
 
 # ── System dependencies ───────────────────────────────────────────────
 
@@ -27,12 +29,12 @@ add_library(ptls::core       STATIC IMPORTED)
 add_library(ptls::openssl    STATIC IMPORTED)
 add_library(ptls::minicrypto STATIC IMPORTED)
 set_target_properties(ptls::core PROPERTIES
-    IMPORTED_LOCATION "${MOQ5_BUILD}/picotls/libpicotls-core.a")
+    IMPORTED_LOCATION "${MOQ5_PTLS_BUILD}/libpicotls-core.a")
 set_target_properties(ptls::openssl PROPERTIES
-    IMPORTED_LOCATION "${MOQ5_BUILD}/picotls/libpicotls-openssl.a"
+    IMPORTED_LOCATION "${MOQ5_PTLS_BUILD}/libpicotls-openssl.a"
     INTERFACE_LINK_LIBRARIES "ptls::core;OpenSSL::SSL;OpenSSL::Crypto")
 set_target_properties(ptls::minicrypto PROPERTIES
-    IMPORTED_LOCATION "${MOQ5_BUILD}/picotls/libpicotls-minicrypto.a"
+    IMPORTED_LOCATION "${MOQ5_PTLS_BUILD}/libpicotls-minicrypto.a"
     INTERFACE_LINK_LIBRARIES "ptls::core")
 
 # picoquic

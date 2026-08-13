@@ -103,15 +103,64 @@ let ptzKeepAliveTimer: number | null = null;
 const PTZ_DURATION_MS = 300;
 const PTZ_KEEPALIVE_MS = 10_000;
 
+// ─── AI Overlay State ─────────────────────────────────────────────────
+
+type Prediction = {
+    class_id: number;
+    label: string;
+    confidence: number;
+    bbox: [number, number, number, number]; // [x1, y1, x2, y2]
+};
+
+type AiDataMessage = {
+    success: boolean;
+    count: number;
+    predictions: Prediction[];
+    timestamp: number;
+    groupId: number;
+};
+
+let aiOverlayActive = false;
+let aiTransport: WebTransport | null = null;
+let aiConnection: MoqtConnection | null = null;
+let aiDetections: Prediction[] = [];
+let aiDetectionTimeout: number | null = null;
+
+// ─── Catalog / track-switch state ─────────────────────────────────────
+let mainConnection: MoqtConnection | null = null;
+let mainLiveNamespace = '';
+let catalogVideoTracks: CatalogTrack[] = [];
+let activeVideoTrackName = '';
+
+// ─── Map for subscription tracking ──────────────────────────────────
+const subscriptionAliases = new Map<bigint, bigint>();
+
+// ─── Debug flags ────────────────────────────────────────────────────
+const DEBUG_ONOBJECT = false;  // Set to true to log all onObject events
+
 // ─── DOM ─────────────────────────────────────────────────────────────
 
 const canvas = document.getElementById('canvas') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
+const overlayCanvas = document.getElementById('overlay-canvas') as HTMLCanvasElement;
+const overlayCtx = overlayCanvas.getContext('2d')!;
+const videoBadgeEl = document.querySelector<HTMLDivElement>('.video-badge');
 const statsEl = document.getElementById('stats')!;
 const startBtn = document.getElementById('start') as HTMLButtonElement;
 const startControlsBtn = document.getElementById('start-controls') as HTMLButtonElement;
+const aiOverlayBtn = document.getElementById('ai-overlay') as HTMLButtonElement;
 const ptzButtons = document.querySelectorAll<HTMLButtonElement>('[data-ptz-action]');
 
+// ─── Sync log panel height to video panel ────────────────────────────
+{
+    const videoPanel = document.querySelector<HTMLElement>('.layout > .panel');
+    const logPanel = document.querySelector<HTMLElement>('.log-panel');
+    if (videoPanel && logPanel) {
+        const sync = () => { logPanel.style.height = `${videoPanel.offsetHeight}px`; };
+        new ResizeObserver(sync).observe(videoPanel);
+        sync();
+    }
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -162,6 +211,24 @@ function encodeNamespace(ns: string): Uint8Array[] {
         .map((segment) => segment.trim())
         .filter((segment) => segment.length > 0)
         .map((segment) => enc.encode(segment));
+}
+
+/**
+ * Wait for subscription to complete and get the trackAlias assigned by the server.
+ */
+async function waitForSubscriptionAlias(
+    requestId: bigint,
+    timeoutMs = 5000,
+): Promise<bigint> {
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+        const alias = subscriptionAliases.get(requestId);
+        if (alias !== undefined) {
+            return alias;
+        }
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error(`Subscription ${requestId} did not receive trackAlias within ${timeoutMs}ms`);
 }
 
 function updateStats(): void {
@@ -488,27 +555,294 @@ function createAudioDecoder(config: AudioDecoderConfig): void {
 // We gate the entire flow on the Start button click.
 startBtn.addEventListener('click', () => {
     startBtn.disabled = true;
-    startBtn.textContent = 'Starting...';
+    startBtn.textContent = 'Video : Connecting';
+    startBtn.className = 'state-btn connecting';
     audioCtx = new AudioContext();
     log(`AudioContext created (sampleRate=${audioCtx.sampleRate}).`);
-    main().catch((err) => {
-        log(`Fatal: ${(err as Error).message}`);
-        console.error(err);
-    });
+    main()
+        .then(() => {
+            startBtn.textContent = 'Video : Connected';
+            startBtn.className = 'state-btn active';
+        })
+        .catch((err) => {
+            startBtn.textContent = 'Video : Error';
+            startBtn.className = 'state-btn error';
+            startBtn.disabled = false;
+            log(`Fatal: ${(err as Error).message}`);
+            console.error(err);
+        });
 });
 // PTZ controls MOQT channel
 startControlsBtn.addEventListener('click', () => {
     startControlsBtn.disabled = true;
-    startControlsBtn.textContent = 'Starting...';
+    startControlsBtn.textContent = 'PTZ : Connecting';
+    startControlsBtn.className = 'state-btn connecting';
 
     // control namespace
     const controlNamespace = namespace+"/control"
     /* PTX controls */
     bindPtzControls();
-    void publishControlTrack(controlNamespace).catch((err) => {
-        log(`PTZ disabled: ${(err as Error).message}`);
-        console.error(err);
-    });
+    void publishControlTrack(controlNamespace)
+        .then(() => {
+            startControlsBtn.textContent = 'PTZ : Connected';
+            startControlsBtn.className = 'state-btn active';
+        })
+        .catch((err) => {
+            startControlsBtn.textContent = 'PTZ : Error';
+            startControlsBtn.className = 'state-btn error';
+            startControlsBtn.disabled = false;
+            log(`PTZ disabled: ${(err as Error).message}`);
+            console.error(err);
+        });
+});
+
+// ─── Track selector ──────────────────────────────────────────────────
+
+function populateTrackSelector(tracks: CatalogTrack[], activeName: string): void {
+    const el = document.getElementById('track-selector');
+    if (!el) return;
+    el.innerHTML = '';
+    if (tracks.length === 0) {
+        el.innerHTML = '<span class="track-pill track-pill--idle">No video tracks</span>';
+        return;
+    }
+    for (const track of tracks) {
+        const isActive = track.name === activeName;
+        const btn = document.createElement('button');
+        btn.className = 'track-pill' + (isActive ? ' active' : '');
+        btn.title = track.name;
+
+        const parts: string[] = [];
+        if (track.width && track.height) parts.push(`${track.width}\u00d7${track.height}`);
+        if (track.bitrate) parts.push(`${(track.bitrate / 1000).toFixed(0)}k`);
+        if (track.framerate) parts.push(`${track.framerate}fps`);
+        if (parts.length === 0) parts.push(track.name);
+        btn.textContent = parts.join(' \u00b7 ');
+
+        if (!isActive) {
+            btn.addEventListener('click', () => {
+                switchVideoTrack(track).catch((e) =>
+                    log(`Track switch error: ${(e as Error).message}`),
+                );
+            });
+        }
+        el.appendChild(btn);
+    }
+}
+
+async function switchVideoTrack(track: CatalogTrack): Promise<void> {
+    if (!mainConnection) {
+        log('Track switch: no active connection.');
+        return;
+    }
+    if (!track.codec) {
+        log(`Track "${track.name}" has no codec — cannot switch.`);
+        return;
+    }
+    if (track.name === activeVideoTrackName) return;
+
+    log(`Switching video track: ${activeVideoTrackName} \u2192 ${track.name}`);
+
+    // Stop routing the old track
+    videoTrackAlias = null;
+    needsKeyframe = true;
+    videoConfigured = false;
+    if (videoDecoder) {
+        try { videoDecoder.reset(); } catch { /* ignore */ }
+    }
+
+    // Apply new track params
+    videoCodec = track.codec;
+    videoWidth = track.width ?? videoWidth;
+    videoHeight = track.height ?? videoHeight;
+    if (track.initData) {
+        const binary = atob(track.initData);
+        videoInitData = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) videoInitData[i] = binary.charCodeAt(i);
+    } else {
+        videoInitData = undefined;
+    }
+    canvas.width = videoWidth;
+    canvas.height = videoHeight;
+    overlayCanvas.width = videoWidth;
+    overlayCanvas.height = videoHeight;
+
+    activeVideoTrackName = track.name;
+    populateTrackSelector(catalogVideoTracks, activeVideoTrackName);
+
+    const reqId = await mainConnection.subscribe(
+        encodeNamespace(mainLiveNamespace),
+        enc.encode(track.name),
+    );
+    log(`   Subscribed to ${track.name} (requestId=${reqId}). Waiting for alias...`);
+    try {
+        videoTrackAlias = await waitForSubscriptionAlias(reqId);
+        log(`   New video trackAlias=${videoTrackAlias}. Waiting for keyframe...`);
+    } catch (e) {
+        log(`   Track switch subscription failed: ${(e as Error).message}`);
+    }
+}
+
+// ─── AI Overlay ──────────────────────────────────────────────────────
+
+function setVideoBadgeBananaWarning(active: boolean): void {
+    if (!videoBadgeEl) return;
+    videoBadgeEl.textContent = active ? 'ALERT' : 'NORMAL';
+    videoBadgeEl.classList.toggle('video-badge--warning', active);
+}
+
+function drawDetections(): void {
+    overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    if (!aiOverlayActive || aiDetections.length === 0) {
+        setVideoBadgeBananaWarning(false);
+        return;
+    }
+
+    overlayCtx.font = 'bold 26px "Segoe UI", "SF Pro Display", sans-serif';
+    overlayCtx.lineWidth = 3;
+    let bananaDetected = false;
+
+    for (const pred of aiDetections) {
+        const [x1, y1, x2, y2] = pred.bbox;
+        const w = x2 - x1;
+        const h = y2 - y1;
+        const isBanana = /banana/i.test(pred.label);
+        if (isBanana) bananaDetected = true;
+        const color = isBanana ? '#f87171' : '#4ade80';
+        const labelBg = isBanana ? 'rgba(60, 8, 8, 0.82)' : 'rgba(2, 19, 31, 0.82)';
+
+        // Bounding box
+        overlayCtx.strokeStyle = color;
+        overlayCtx.strokeRect(x1, y1, w, h);
+
+        // Label string
+        const label = `${pred.label} ${(pred.confidence * 100).toFixed(0)}%`;
+        const metrics = overlayCtx.measureText(label);
+        const padX = 8;
+        const padY = 6;
+        const labelH = 30;
+
+        // Draw label above box (or below if too close to top)
+        const labelY = y1 >= labelH + padY * 2 ? y1 : y2 + labelH + padY * 2;
+        const bgTop = y1 >= labelH + padY * 2
+            ? y1 - labelH - padY * 2
+            : y2 + padY;
+
+        overlayCtx.fillStyle = labelBg;
+        overlayCtx.fillRect(x1 - 1, bgTop, metrics.width + padX * 2, labelH + padY * 2);
+
+        overlayCtx.fillStyle = color;
+        overlayCtx.fillText(label, x1 + padX - 1, labelY - padY);
+    }
+
+    setVideoBadgeBananaWarning(bananaDetected);
+}
+
+async function startAiOverlay(): Promise<void> {
+    const dataNamespace = namespace + '/data';
+    log(`AI: Connecting for AI overlay (${dataNamespace}/objects)...`);
+
+    const transport = new WebTransport(relayUrl, createTransportOptions());
+    await transport.ready;
+    aiTransport = transport;
+
+    const connection = new MoqtConnection(16);
+    let aiTrackAlias: bigint | null = null;
+
+    connection.onMessage = (msg: ControlMessage) => {
+        if (msg.type === 'SUBSCRIBE_OK' && msg.requestId !== undefined) {
+            const trackAlias = (msg as any).trackAlias;
+            if (trackAlias !== undefined) {
+                aiTrackAlias = BigInt(trackAlias);
+                log(`AI: Subscribed to objects track (alias=${aiTrackAlias})`);
+            }
+        }
+    };
+
+    connection.onObject = (_streamId: unknown, obj: MoqtObject) => {
+        if (aiTrackAlias !== null && BigInt(obj.trackAlias) !== aiTrackAlias) return;
+        if (obj.kind === 'gap' || !obj.payload) return;
+
+        try {
+            const text = new TextDecoder().decode(obj.payload);
+            const data = JSON.parse(text) as AiDataMessage;
+            if (data.success && Array.isArray(data.predictions)) {
+                aiDetections = data.predictions;
+                drawDetections();
+                // Auto-clear detections if no new data arrives within 2 s
+                if (aiDetectionTimeout !== null) window.clearTimeout(aiDetectionTimeout);
+                aiDetectionTimeout = window.setTimeout(() => {
+                    aiDetections = [];
+                    drawDetections();
+                }, 2000);
+            }
+        } catch {
+            // Not valid JSON — ignore
+        }
+    };
+
+    connection.onClose = (_error: unknown, _reason: unknown) => {
+        log('AI: Connection closed.');
+        aiConnection = null;
+        aiTransport = null;
+        if (aiOverlayActive) {
+            aiDetections = [];
+            drawDetections();
+        }
+    };
+
+    connection.onError = (error: Error) => {
+        log(`AI: Connection error: ${error.message}`);
+    };
+
+    await connection.connect(transport, { maxRequestId: varint(10) });
+    aiConnection = connection;
+
+    log(`AI: Subscribing to ${dataNamespace} / objects...`);
+    await connection.subscribe(
+        encodeNamespace(dataNamespace),
+        enc.encode('objects'),
+    );
+    log('AI: Listening for YOLO predictions...');
+    aiOverlayBtn.textContent = 'Overlay : Connected';
+    aiOverlayBtn.className = 'state-btn active';
+}
+
+function stopAiOverlay(): void {
+    if (aiDetectionTimeout !== null) {
+        window.clearTimeout(aiDetectionTimeout);
+        aiDetectionTimeout = null;
+    }
+    aiDetections = [];
+    drawDetections();
+
+    if (aiTransport) {
+        try { aiTransport.close(); } catch { /* ignore */ }
+        aiTransport = null;
+    }
+    aiConnection = null;
+    log('AI: Overlay stopped.');
+    aiOverlayBtn.textContent = 'Overlay : Idle';
+    aiOverlayBtn.className = 'state-btn';
+}
+
+aiOverlayBtn.addEventListener('click', () => {
+    aiOverlayActive = !aiOverlayActive;
+    if (aiOverlayActive) {
+        aiOverlayBtn.textContent = 'Overlay : Connecting';
+        aiOverlayBtn.className = 'state-btn connecting';
+        startAiOverlay().catch((err) => {
+            log(`AI overlay failed: ${(err as Error).message}`);
+            aiOverlayActive = false;
+            aiOverlayBtn.textContent = 'Overlay : Error';
+            aiOverlayBtn.className = 'state-btn error';
+            stopAiOverlay();
+        });
+    } else {
+        aiOverlayBtn.textContent = 'Overlay : Idle';
+        aiOverlayBtn.className = 'state-btn';
+        stopAiOverlay();
+    }
 });
 
 async function main(): Promise<void> {
@@ -518,6 +852,9 @@ async function main(): Promise<void> {
 
     // control namespace
     const controlNamespace = namespace+"/control"
+
+    // Clear subscription tracking from previous run
+    subscriptionAliases.clear();
 
     log(`Relay: ${relayUrl}`);
     log(`Live namespace: ${liveNamespace}`);
@@ -544,6 +881,15 @@ async function main(): Promise<void> {
 
     connection.onMessage = (msg) => {
         log(`Control: ${msg.type}`);
+        
+        // Extract trackAlias from SUBSCRIBE_OK messages
+        if (msg.type === 'SUBSCRIBE_OK' && msg.requestId !== undefined) {
+            const trackAlias = (msg as any).trackAlias;
+            if (trackAlias !== undefined) {
+                subscriptionAliases.set(msg.requestId, BigInt(trackAlias));
+                log(`[onMessage] SUBSCRIBE_OK: requestId=${msg.requestId} -> trackAlias=${trackAlias}`);
+            }
+        }
     };
 
     connection.onClose = (error, reason) => {
@@ -570,8 +916,12 @@ async function main(): Promise<void> {
     const catalogPromise = new Promise<Catalog>((resolve) => {
         catalogResolved = resolve;
     });
+    let catalogReqId: bigint | null = null;
 
     connection.onObject = (_streamId, obj) => {
+        // Debug: log all incoming objects
+        if (DEBUG_ONOBJECT) log(`[onObject] trackAlias=${obj.trackAlias}, kind=${obj.kind}, groupId=${obj.groupId}, objectId=${obj.objectId}, payloadSize=${obj.payload?.byteLength ?? 0}`);
+
         // Route by track alias
         if (videoTrackAlias !== null && BigInt(obj.trackAlias) === BigInt(videoTrackAlias)) {
             handleVideoObject(obj);
@@ -582,14 +932,75 @@ async function main(): Promise<void> {
             return;
         }
 
+        // Check if this is the catalog fetch response
+        if (catalogReqId !== null && BigInt(obj.trackAlias) === BigInt(catalogReqId)) {
+            if (DEBUG_ONOBJECT) log(`[onObject] Matched catalogReqId, attempting to parse...`);
+            if (obj.kind === 'gap') {
+                if (DEBUG_ONOBJECT) log(`[onObject] Catalog is a gap, skipping`);
+                return;
+            }
+            try {
+                // Try parsing as binary MSF first
+                try {
+                    const catalog = parseCatalog(obj.payload!, liveNamespace);
+                    if (DEBUG_ONOBJECT) log(`[onObject] Successfully parsed catalog from fetch response (binary MSF)!`);
+                    catalogResolved?.(catalog);
+                    catalogResolved = null;
+                    catalogReqId = null;  // Stop looking for catalog objects
+                    return;
+                } catch (binaryError) {
+                    // Binary parse failed, try JSON
+                    if (DEBUG_ONOBJECT) log(`[onObject] Binary MSF parse failed, attempting JSON parse...`);
+                }
+
+                // Try parsing as JSON
+                const jsonStr = new TextDecoder().decode(obj.payload);
+                const jsonCatalog = JSON.parse(jsonStr);
+                
+                // Convert JSON to Catalog format
+                const catalog: Catalog = {
+                    version: Number(jsonCatalog.version),
+                    generatedAt: jsonCatalog.generatedAt,
+                    tracks: (jsonCatalog.tracks || []).map((t: any) => ({
+                        name: t.name,
+                        packaging: t.packaging,
+                        isLive: t.isLive,
+                        role: t.role,
+                        codec: t.codec,
+                        width: t.width,
+                        height: t.height,
+                        bitrate: t.bitrate,
+                        framerate: t.framerate,
+                        samplerate: t.samplerate,
+                        channelConfig: t.channelConfig,
+                        initData: t.initData,
+                    } as CatalogTrack)),
+                };
+                
+                if (DEBUG_ONOBJECT) log(`[onObject] Successfully parsed catalog from fetch response (JSON)!`);
+                catalogResolved?.(catalog);
+                catalogResolved = null;
+                catalogReqId = null;  // Stop looking for catalog objects
+            } catch (e) {
+                if (DEBUG_ONOBJECT) log(`[onObject] Failed to parse fetch response as catalog: ${(e as Error).message}`);
+            }
+            return;
+        }
+
         // Assume anything else before media subscriptions is catalog
-        if (obj.kind === 'gap') return;
-        try {
-            const catalog = parseCatalog(obj.payload!, liveNamespace);
-            catalogResolved?.(catalog);
-            catalogResolved = null;
-        } catch {
-            // Not a valid catalog — ignore
+        // Only do this if we're still waiting for the catalog (catalogReqId not yet cleared)
+        if (catalogReqId !== null && obj.kind !== 'gap') {
+            try {
+                if (DEBUG_ONOBJECT) log(`[onObject] Attempting to parse catalog...`);
+                const catalog = parseCatalog(obj.payload!, liveNamespace);
+                if (DEBUG_ONOBJECT) log(`[onObject] Successfully parsed catalog!`);
+                catalogResolved?.(catalog);
+                catalogResolved = null;
+                catalogReqId = null;  // Stop looking for catalog objects
+            } catch (e) {
+                // Not a valid catalog — ignore
+                if (DEBUG_ONOBJECT) log(`[onObject] Failed to parse as catalog: ${(e as Error).message}`);
+            }
         }
     };
 
@@ -601,6 +1012,8 @@ async function main(): Promise<void> {
         maxRequestId: varint(100),
     });
     log(`   Session established (state: ${connection.session.state}).`);
+    mainConnection = connection;
+    mainLiveNamespace = liveNamespace;
 
 
     /* SUBSCRIBE OR FETCH CATALOG */
@@ -624,11 +1037,12 @@ async function main(): Promise<void> {
     // @see draft-ietf-moq-msf-00 §5
     log('5: Fetching catalog...');
     const nsBytes = encodeNamespace(liveNamespace);
-    const catalogReqId = await connection.fetch(nsBytes, enc.encode(CATALOG_TRACK_NAME), {
+    catalogReqId = await connection.fetch(nsBytes, enc.encode(CATALOG_TRACK_NAME), {
         startGroup: varint(0n), startObject: varint(0n),
         endGroup: varint(0n), endObject: varint(0n),
     });
-    log(`   FETCH catalog: reqId=${catalogReqId} group=0 object=0`);
+    log(`   FETCH catalog: reqId=${catalogReqId} (type: ${typeof catalogReqId}) group=0 object=0`);
+    log(`   Catalog trackAlias should be: ${catalogReqId}`);
     log('   Waiting for catalog...');
 
     /* END SUBSCRIBE OR FETCH CATALOG */
@@ -682,7 +1096,11 @@ async function main(): Promise<void> {
 
     log(`   Video: ${videoTrack.name} | ${videoCodec} | ${videoWidth}x${videoHeight}`);
 
-    // ── 7. Find audio track ────────────────────────────────────────
+    catalogVideoTracks = catalog.tracks.filter(
+        (t) => t.role === 'video' && t.packaging === 'loc',
+    );
+    activeVideoTrackName = videoTrack.name;
+    populateTrackSelector(catalogVideoTracks, activeVideoTrackName);
     // @see draft-ietf-moq-msf-00 §5.1.12 (packaging)
     // @see draft-ietf-moq-msf-00 §5.1.24 (codec)
 
@@ -761,8 +1179,13 @@ async function main(): Promise<void> {
         encodeNamespace(liveNamespace),
         enc.encode(videoTrack.name),
     );
-    log(`   Video subscribed (requestId=${videoReqId}). Waiting for frames...`);
-    videoTrackAlias = videoReqId;
+    log(`   Video subscribed (requestId=${videoReqId}). Waiting for trackAlias...`);
+    try {
+        videoTrackAlias = await waitForSubscriptionAlias(videoReqId);
+        log(`   Video trackAlias=${videoTrackAlias}. Waiting for frames...`);
+    } catch (e) {
+        log(`   Video subscription failed: ${(e as Error).message}`);
+    }
 
     // ── 11. Subscribe to audio track ───────────────────────────────
     log('11. Subscribing to audio track...');
@@ -771,11 +1194,16 @@ async function main(): Promise<void> {
             encodeNamespace(liveNamespace),
             enc.encode(audioTrack.name),
         );
-        log(`   Audio subscribed (requestId=${audioReqId}).`);
-        audioTrackAlias = audioReqId;
+        log(`   Audio subscribed (requestId=${audioReqId}). Waiting for trackAlias...`);
+        try {
+            audioTrackAlias = await waitForSubscriptionAlias(audioReqId);
+            log(`   Audio trackAlias=${audioTrackAlias}.`);
+        } catch (e) {
+            log(`   Audio subscription failed: ${(e as Error).message}`);
+        }
     }
 
-    startBtn.textContent = 'Playing';
+    startBtn.textContent = 'Video : Connected';
 }
 
 // ─── Video object handler ────────────────────────────────────────────

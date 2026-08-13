@@ -32,7 +32,7 @@
     }
 
     .page {
-      width: min(1360px, calc(100% - 32px));
+      width: calc(100% - 32px);
       margin: 24px auto 48px;
       display: grid;
       gap: 24px;
@@ -132,11 +132,54 @@
       background: linear-gradient(135deg, rgba(255, 180, 79, 0.95), rgba(255, 118, 61, 0.9));
     }
 
+    .ai-action {
+      min-width: 160px;
+      padding: 14px 18px;
+      font-size: 1rem;
+      font-weight: 700;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+      color: var(--muted);
+      background: linear-gradient(135deg, rgba(74, 222, 128, 0.08), rgba(59, 130, 246, 0.06));
+      border: 1px solid rgba(74, 222, 128, 0.22) !important;
+    }
+
+    .ai-action.active {
+      color: #02131f;
+      background: linear-gradient(135deg, #4ade80 0%, #22d3ee 100%);
+      border-color: transparent !important;
+    }
+
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.85fr) minmax(320px, 0.95fr);
+      grid-template-columns: minmax(0, 1fr) minmax(500px, 700px);
+      grid-template-rows: auto auto;
       gap: 24px;
       align-items: start;
+    }
+
+    /* Video: col 1 row 1 */
+    .layout > .panel:first-child {
+      grid-column: 1;
+      grid-row: 1;
+    }
+
+    /* PTZ + controls: row 2, full width */
+    .bottom-row {
+      grid-column: 1 / 3;
+      grid-row: 2;
+      display: flex;
+      gap: 24px;
+      align-items: flex-start;
+    }
+
+    /* Log: col 2, row 1 — height set by JS to match video panel */
+    .log-panel {
+      grid-column: 2;
+      grid-row: 1;
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
     }
 
     .panel {
@@ -182,6 +225,16 @@
       object-fit: contain;
     }
 
+    #overlay-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      background: transparent;
+    }
+
     .video-badge {
       position: absolute;
       top: 14px;
@@ -196,9 +249,111 @@
       text-transform: uppercase;
     }
 
+    .video-badge--warning {
+      background: rgba(60, 8, 8, 0.78);
+      border-color: rgba(248, 113, 113, 0.45);
+      color: #f87171;
+    }
+
     .controls-card {
-      display: grid;
-      gap: 18px;
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+
+    .control-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 170px;
+      flex-shrink: 0;
+    }
+
+    .state-btn {
+      padding: 5px 14px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      width: 100%;
+      min-width: 195px;
+      text-align: left;
+      background: rgba(131, 169, 214, 0.08);
+      color: var(--muted);
+      border: 1px solid rgba(131, 169, 214, 0.18) !important;
+      min-height: 0;
+    }
+
+    .state-btn:hover:not(:disabled):not(.active):not(.connecting) {
+      background: rgba(131, 169, 214, 0.14);
+      color: var(--text);
+    }
+
+    .state-btn.connecting {
+      background: rgba(255, 180, 79, 0.12);
+      color: var(--accent-warm);
+      border-color: rgba(255, 180, 79, 0.3) !important;
+    }
+
+    .state-btn.active {
+      background: rgba(74, 222, 128, 0.12);
+      color: #4ade80;
+      border-color: rgba(74, 222, 128, 0.3) !important;
+    }
+
+    .state-btn.error {
+      background: rgba(248, 113, 113, 0.12);
+      color: #f87171;
+      border-color: rgba(248, 113, 113, 0.3) !important;
+    }
+
+    .track-section {
+      margin-top: 8px;
+      padding-top: 12px;
+      border-top: 1px solid rgba(131, 169, 214, 0.1);
+    }
+
+    .track-selector {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .track-pill {
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-align: left;
+      background: rgba(131, 169, 214, 0.07);
+      color: var(--muted);
+      border: 1px solid rgba(131, 169, 214, 0.14) !important;
+      cursor: pointer;
+      min-height: 0;
+      width: 100%;
+      letter-spacing: 0.02em;
+      transition: background 150ms, color 150ms, border-color 150ms;
+    }
+
+    .track-pill.active {
+      background: rgba(83, 211, 255, 0.12);
+      color: var(--accent);
+      border-color: rgba(83, 211, 255, 0.28) !important;
+      cursor: default;
+    }
+
+    .track-pill:hover:not(.active):not(.track-pill--idle) {
+      background: rgba(131, 169, 214, 0.15);
+      color: var(--text);
+      border-color: rgba(131, 169, 214, 0.3) !important;
+    }
+
+    .track-pill--idle {
+      font-style: italic;
+      cursor: default;
+      pointer-events: none;
     }
 
     .controls-copy {
@@ -245,7 +400,7 @@
     .zoom-row,
     .preset-row {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: 1fr;
       gap: 10px;
     }
 
@@ -262,15 +417,14 @@
       overflow: hidden;
     }
 
-    .diagram h2,
     .controls-card h2,
     .log-panel h2 {
       margin: 0 0 10px;
       font-size: 1.15rem;
       letter-spacing: 0.01em;
+      flex-shrink: 0;
     }
 
-    .diagram p,
     .log-panel p {
       margin: 0 0 18px;
       color: var(--muted);
@@ -376,10 +530,6 @@
       content: "←";
     }
 
-    .log-panel {
-      padding: 22px;
-    }
-
     pre {
       margin: 0;
       background: var(--bg-panel);
@@ -387,8 +537,9 @@
       padding: 16px;
       border-radius: 18px;
       border: 1px solid rgba(131, 169, 214, 0.12);
-      font-size: 0.85rem;
-      max-height: 40vh;
+      font-size: 0.75rem;
+      flex: 1;
+      min-height: 0;
       overflow-y: auto;
       white-space: pre-wrap;
       line-height: 1.5;
@@ -397,22 +548,14 @@
     @media (max-width: 1080px) {
       .layout {
         grid-template-columns: 1fr;
+        grid-template-rows: auto;
       }
 
-      .simple-flow {
-        grid-template-columns: 1fr;
-      }
-
-      .simple-arrow,
-      .camera-link {
-        min-width: 0;
-        padding: 4px 0;
-      }
-
-      .simple-arrow::after,
-      .camera-link::after {
-        content: "↓";
-        margin-top: 6px;
+      .layout > .panel:first-child,
+      .controls-card,
+      .log-panel {
+        grid-column: 1;
+        grid-row: auto;
       }
     }
 
@@ -424,7 +567,6 @@
 
       .hero,
       .panel,
-      .diagram,
       .log-panel {
         border-radius: 20px;
       }
@@ -456,8 +598,6 @@
       <div class="meta-pill">PTZ control over MOQT objects</div>
     </div>-->
     <div class="hero-actions">
-      <button id="start" class="primary-action">Start Live Stream</button>
-      <button id="start-controls" class="secondary-action">Arm PTZ Controls</button>
     </div>
   </section>
 
@@ -468,14 +608,31 @@
         <div id="stats">Video: 0 frames | Audio: 0 chunks</div>
       </div>
       <div class="video-frame">
-        <div class="video-badge">WT → MOQT → LOC → WebCodecs</div>
+        <div class="video-badge">NORMAL</div>
         <canvas id="canvas" width="1920" height="1080"></canvas>
+        <canvas id="overlay-canvas" width="1920" height="1080"></canvas>
       </div>
     </section>
 
-    <aside class="panel controls-card">
+    <div class="bottom-row">
+      <aside class="panel control-panel">
+
+          <p class="section-label" style="margin:0 0 6px">Connections</p>
+        <button id="start" class="state-btn">Video : Idle</button>
+        <button id="start-controls" class="state-btn">PTZ : Idle</button>
+        <button id="ai-overlay" class="state-btn">Overlay : Idle</button>
+      </aside>
+      <aside class="panel control-panel">
+        <!--<div class="track-section">-->
+          <p class="section-label" style="margin:0 0 6px">Tracks</p>
+          <div id="track-selector" class="track-selector">
+            <span class="track-pill track-pill--idle">— Idle —</span>
+          </div>
+        <!--</div>-->
+      </aside>
+      <aside class="panel controls-card">
       <div>
-        <h2>PTZ Controls</h2>
+        <!--<h2>PTZ Controls</h2>-->
        <!-- <p class="controls-copy">On-screen controls send atomic PTZ commands over the control namespace. Each press emits one bounded movement or preset recall; no keyboard bindings are used.</p> -->
       </div>
 
@@ -495,7 +652,7 @@
           </button>
           <button class="ptz-btn ptz-btn--center" type="button" disabled>
             <strong>PTZ</strong>
-            <span>Atomic 300ms</span>
+            <span></span>
           </button>
           <button class="ptz-btn" data-ptz-action="move" data-ptz-axis="pan" data-ptz-value="0.4">
             <strong>→</strong>
@@ -547,44 +704,13 @@
         </div>
       </div>
     </aside>
-  </section>
 
-  <section class="diagram">
-    <h2>End-to-End Flow</h2>
-    <p>RTSP flows to the adaptor. PTZ commands flow back to the camera over a separate API path.</p>
-    <div class="simple-flow">
-      <div class="simple-node">
-        <strong>Browser</strong>
-        <span>Subscribes to live media.</span>
-        <span>Sends PTZ control objects.</span>
-      </div>
-      <div class="simple-arrow simple-arrow--bidirectional">MOQT</div>
-      <div class="simple-node">
-        <strong>Relay</strong>
-        <span>Routes media and control traffic.</span>
-      </div>
-      <div class="simple-arrow simple-arrow--bidirectional">MOQT</div>
-      <div class="simple-node">
-        <strong>MOQT Adaptor</strong>
-        <span>Publishes media.</span>
-        <span>Maps control objects to <code>ptz-cam-1/*</code>.</span>
-      </div>
-      <div class="camera-links">
-        <div class="camera-link camera-link--reverse">RTSP</div>
-        <div class="camera-link camera-link--forward">PTZ API</div>
-      </div>
-      <div class="simple-node simple-node--warm">
-        <strong>PTZ Camera</strong>
-        <span>Video source.</span>
-        <span>Receives pan, tilt, zoom commands.</span>
-      </div>
     </div>
-  </section>
 
-  <section class="log-panel">
-    <h2>Runtime Log</h2>
-    <p>Control-session events, relay subscriptions, and media decode state are captured here for debugging.</p>
-    <pre id="log"></pre>
+    <section class="log-panel panel">
+      <h2>Runtime Log</h2>
+      <pre id="log"></pre>
+    </section>
   </section>
 </main>
 <script type="module" src="main.ts"></script>

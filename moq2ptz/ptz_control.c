@@ -32,7 +32,6 @@
  */
 
 #include <moq/picoquic_threaded.h>
-#include <moq/subscriber.h>
 #include <moq/rcbuf.h>
 #include <moq/url.h>
 #include <moq/session.h>
@@ -288,71 +287,231 @@ static void dispatch(cmd_queue_t *q, const cam_cfg_t *cfg,
 /* ── Application context ─────────────────────────────────────────────── */
 
 typedef struct {
-    moq_subscriber_t  *sub;
-    moq_sub_track_t   *track;
-    bool               subscribed;
+    moq_ns_sub_handle_t ns_sub;
+    moq_subscription_t  sub;
+    bool                ns_sub_ok;
+    bool                control_seen;
+    bool                subscribed;
     moq_bytes_t        ns_parts[32];
     size_t             ns_count;
     const char        *track_name;
     cmd_queue_t        q;
     const cam_cfg_t   *cfg;
     unsigned long long n_commands;
+    uint64_t           ns_subscribe_sent_us;
+    uint64_t           subscribe_sent_us;
+    bool               need_retry;        /* timeout — ask main to reconnect    */
+    bool               dots_pending;      /* dots printed, needs \n before next  */
 } app_ctx_t;
+
+static bool bytes_eq_cstr(moq_bytes_t b, const char *s)
+{
+    size_t n = strlen(s);
+    return b.data && b.len == n && memcmp(b.data, s, n) == 0;
+}
+
+static bool ns_suffix_is_exact_prefix(const moq_namespace_t *suffix)
+{
+    return suffix && suffix->count == 0;
+}
+
+static void log_ns_suffix(const char *prefix, const moq_namespace_t *suffix)
+{
+    fprintf(stderr, "%s", prefix);
+    if (!suffix || suffix->count == 0) {
+        fprintf(stderr, "<empty>\n");
+        return;
+    }
+
+    for (size_t i = 0; i < suffix->count; i++) {
+        fprintf(stderr, "%s%.*s", (i == 0 ? "" : "/"),
+                (int)suffix->parts[i].len, suffix->parts[i].data);
+    }
+    fprintf(stderr, "\n");
+}
+
+static moq_result_t subscribe_command_track(moq_session_t *sess,
+                                            const app_ctx_t *app,
+                                            uint64_t now_us,
+                                            moq_subscription_t *out)
+{
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace.parts = app->ns_parts;
+    sc.track_namespace.count = app->ns_count;
+    sc.track_name.data       = (const uint8_t *)app->track_name;
+    sc.track_name.len        = strlen(app->track_name);
+    sc.filter                = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+
+    return moq_session_subscribe(sess, &sc, now_us, out);
+}
 
 /* ── on_pump (network thread) ───────────────────────────────────────── */
 
-static int on_pump(moq_pq_threaded_t *t, uint64_t now_us, void *vctx)
+static int on_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                   uint64_t now_us, void *vctx)
 {
+    (void)lane;
     app_ctx_t *app = (app_ctx_t *)vctx;
     if (g_stop) return 1;
 
     moq_session_t *sess = moq_pq_threaded_session(t);
     if (!sess) return 0;
 
-    /* One-shot: create subscriber + send SUBSCRIBE once established */
-    if (!app->sub && moq_session_state(sess) == MOQ_SESS_ESTABLISHED) {
-        moq_sub_cfg_t scfg; moq_sub_cfg_init(&scfg);
-        scfg.max_tracks  = 4;
-        scfg.max_objects = 64;
-        if (moq_sub_create(sess, moq_alloc_default(), &scfg, &app->sub) != MOQ_OK) {
-            fprintf(stderr, "PTZ: moq_sub_create failed\n"); return 1;
-        }
+    /* One-shot: subscribe namespace prefix once established. */
+    if (!moq_ns_sub_handle_is_valid(app->ns_sub) &&
+        moq_session_state(sess) == MOQ_SESS_ESTABLISHED) {
+        moq_subscribe_namespace_cfg_t ncfg;
+        moq_subscribe_namespace_cfg_init(&ncfg);
+        ncfg.track_namespace_prefix.parts = app->ns_parts;
+        ncfg.track_namespace_prefix.count = app->ns_count;
+        ncfg.namespace_interest           = MOQ_NAMESPACE_INTEREST_BOTH;
 
-        moq_sub_track_cfg_t tcfg; moq_sub_track_cfg_init(&tcfg);
-        tcfg.track_namespace.parts = app->ns_parts;
-        tcfg.track_namespace.count = app->ns_count;
-        tcfg.track_name.data       = (const uint8_t *)app->track_name;
-        tcfg.track_name.len        = strlen(app->track_name);
-
-        moq_result_t rc = moq_sub_subscribe(app->sub, &tcfg, now_us, &app->track);
-        if (rc != MOQ_OK) {
-            fprintf(stderr, "PTZ: moq_sub_subscribe failed: %d\n", (int)rc);
+        moq_result_t rc = moq_session_subscribe_namespace(sess, &ncfg, now_us, &app->ns_sub);
+        if (rc == MOQ_OK) {
+            app->ns_subscribe_sent_us = now_us;
+            if (app->dots_pending) { fprintf(stderr, "\n"); app->dots_pending = false; }
+            fprintf(stderr, "PTZ: SUBSCRIBE_NAMESPACE (%s) sent (handle=%llu)\n",
+                    app->ns_parts[0].data, (unsigned long long)moq_ns_sub_handle_id_for_trace(app->ns_sub));
+        } else if (rc != MOQ_ERR_WOULD_BLOCK && rc != MOQ_ERR_REQUEST_BLOCKED) {
+            fprintf(stderr, "PTZ: moq_session_subscribe_namespace failed: %d\n", (int)rc);
+            app->need_retry = true;
             return 1;
         }
-        fprintf(stderr, "PTZ: SUBSCRIBE sent for '%s'\n", app->track_name);
     }
 
-    if (!app->sub) return 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(sess, &ev, 1) == 1) {
+        switch (ev.kind) {
+        case MOQ_EVENT_NS_SUB_OK:
+            if (moq_ns_sub_handle_eq(ev.u.ns_sub_ok.handle, app->ns_sub)) {
+                app->ns_sub_ok = true;
+                fprintf(stderr, "PTZ: Waiting for NAMESPACE...\n");
+            }
+            break;
 
-    moq_sub_tick(app->sub, now_us);
+        case MOQ_EVENT_NS_SUB_ERROR:
+            if (moq_ns_sub_handle_eq(ev.u.ns_sub_error.handle, app->ns_sub)) {
+                fprintf(stderr, "PTZ: namespace subscribe rejected (err=%u)\n",
+                        (unsigned)ev.u.ns_sub_error.error_code);
+                app->need_retry = true;
+            }
+            break;
 
-    if (app->track && !app->subscribed && moq_sub_track_is_active(app->track)) {
-        app->subscribed = true;
-        fprintf(stderr, "PTZ: subscription ACTIVE — waiting for commands...\n");
-    }
+        case MOQ_EVENT_NAMESPACE_FOUND:
+            if (moq_ns_sub_handle_eq(ev.u.namespace_found.handle, app->ns_sub)) {
+                log_ns_suffix("PTZ: namespace found suffix: ",
+                              &ev.u.namespace_found.track_namespace_suffix);
+                if (ns_suffix_is_exact_prefix(&ev.u.namespace_found.track_namespace_suffix)) {
+                    app->control_seen = true;
+                    if (app->dots_pending) { fprintf(stderr, "\n"); app->dots_pending = false; }
+                    fprintf(stderr, "PTZ: target namespace discovered\n");
+                }
+            }
+            break;
 
-    moq_sub_object_t obj;
-    while (moq_sub_poll_object(app->sub, &obj) == MOQ_OK) {
-        if (obj.payload && moq_rcbuf_len(obj.payload) > 0) {
-            const uint8_t *data = (const uint8_t *)moq_rcbuf_data(obj.payload);
-            size_t len = moq_rcbuf_len(obj.payload);
-            fprintf(stderr, "PTZ: object %zu bytes: %.*s\n",
-                    len, (int)(len < 120 ? len : 120), data);
-            dispatch(&app->q, app->cfg, data, len);
-            app->n_commands++;
+        case MOQ_EVENT_NAMESPACE_GONE:
+            if (moq_ns_sub_handle_eq(ev.u.namespace_gone.handle, app->ns_sub)) {
+                log_ns_suffix("PTZ: namespace gone suffix: ",
+                              &ev.u.namespace_gone.track_namespace_suffix);
+                if (ns_suffix_is_exact_prefix(&ev.u.namespace_gone.track_namespace_suffix)) {
+                    fprintf(stderr, "PTZ: target namespace withdrawn, reconnecting...\n");
+                    app->need_retry = true;
+                }
+            }
+            break;
+
+        case MOQ_EVENT_SESSION_CLOSED:
+            fprintf(stderr, "PTZ: session closed (code=%llu), reconnecting...\n",
+                    (unsigned long long)ev.u.closed.code);
+            app->need_retry = true;
+            break;
+
+        case MOQ_EVENT_SUBSCRIBE_OK:
+            if (moq_subscription_eq(ev.u.subscribe_ok.sub, app->sub)) {
+                app->subscribed = true;
+                fprintf(stderr, "PTZ: subscription ACTIVE — waiting for commands...\n");
+            }
+            break;
+
+        case MOQ_EVENT_SUBSCRIBE_ERROR:
+            if (moq_subscription_eq(ev.u.subscribe_error.sub, app->sub)) {
+                fprintf(stderr, "PTZ: SUBSCRIBE rejected (err=%u), retrying...\n",
+                        (unsigned)ev.u.subscribe_error.error_code);
+                app->need_retry = true;
+            }
+            break;
+
+        case MOQ_EVENT_SUBSCRIBE_DONE:
+            if (moq_subscription_eq(ev.u.subscribe_done.sub, app->sub)) {
+                fprintf(stderr, "PTZ: publisher ended track, reconnecting...\n");
+                app->need_retry = true;
+            }
+            break;
+
+        case MOQ_EVENT_UNSUBSCRIBED:
+            if (moq_subscription_eq(ev.u.unsubscribed.sub, app->sub)) {
+                fprintf(stderr, "PTZ: unsubscribed, reconnecting...\n");
+                app->need_retry = true;
+            }
+            break;
+
+        case MOQ_EVENT_OBJECT_RECEIVED:
+            if (moq_subscription_eq(ev.u.object_received.sub, app->sub) &&
+                ev.u.object_received.payload &&
+                moq_rcbuf_len(ev.u.object_received.payload) > 0) {
+                const uint8_t *data =
+                    (const uint8_t *)moq_rcbuf_data(ev.u.object_received.payload);
+                size_t len = moq_rcbuf_len(ev.u.object_received.payload);
+                fprintf(stderr, "PTZ: object %zu bytes: %.*s\n",
+                        len, (int)(len < 120 ? len : 120), data);
+                dispatch(&app->q, app->cfg, data, len);
+                app->n_commands++;
+            }
+            break;
+
+        default:
+            break;
         }
-        moq_sub_object_cleanup(&obj);
+
+        moq_event_cleanup(&ev);
+        if (app->need_retry) return 1;
     }
+
+    if (app->control_seen && !moq_subscription_is_valid(app->sub)) {
+        moq_subscription_t sub = MOQ_SUBSCRIPTION_INVALID;
+        moq_result_t rc = subscribe_command_track(sess, app, now_us, &sub);
+        if (rc == MOQ_OK) {
+            app->sub = sub;
+            app->subscribe_sent_us = now_us;
+            fprintf(stderr, "PTZ: SUBSCRIBE sent for discovered namespace track '%s'\n",
+                    app->track_name);
+        } else if (rc != MOQ_ERR_WOULD_BLOCK && rc != MOQ_ERR_REQUEST_BLOCKED) {
+            fprintf(stderr, "PTZ: moq_session_subscribe failed: %d\n", (int)rc);
+            app->need_retry = true;
+            return 1;
+        }
+    }
+
+    if (moq_ns_sub_handle_is_valid(app->ns_sub) && !app->ns_sub_ok &&
+        app->ns_subscribe_sent_us &&
+        now_us - app->ns_subscribe_sent_us > 5000000ULL) {
+        app->need_retry = true;
+        return 1;
+    }
+
+    if (moq_subscription_is_valid(app->sub) && !app->subscribed &&
+        app->subscribe_sent_us &&
+        now_us - app->subscribe_sent_us > 5000000ULL) {
+        app->need_retry = true;
+        return 1;
+    }
+
+    if (moq_session_state(sess) == MOQ_SESS_CLOSED) {
+        app->need_retry = true;
+        return 1;
+    }
+
     return 0;
 }
 
@@ -442,38 +601,80 @@ int main(int argc, char **argv)
     tcfg.insecure_skip_verify     = insecure;
     tcfg.send_request_capacity    = true;
     tcfg.initial_request_capacity = 64;
-    tcfg.on_pump                  = on_pump;
-    tcfg.on_pump_ctx              = &app;
+    tcfg.on_lane_pump             = on_pump;
+    tcfg.on_lane_pump_ctx         = &app;
 
-    moq_pq_threaded_t *t = NULL;
-    moq_result_t rc = moq_pq_threaded_create(&tcfg, &t);
-    if (rc != MOQ_OK) {
-        fprintf(stderr, "moq_pq_threaded_create failed: %d\n", (int)rc);
-        q_stop(&app.q); pthread_join(worker, NULL); return 1;
-    }
-    g_threaded = t;
-
-    fprintf(stderr, "PTZ control receiver started.\n");
+    fprintf(stderr, "PTZ control receiver started - v0.1.0\n");
     fprintf(stderr, "  relay:     %s:%d\n", host_buf, (int)u.port);
     fprintf(stderr, "  namespace: %s\n", argv[2]);
     fprintf(stderr, "  track:     %s\n", track_name);
     fprintf(stderr, "  camera:    http://%s (speed=%u, max_ms=%u)\n",
             cam.cam_ip, cam.cam_speed, cam.max_duration_ms);
 
-    /* Block until stopped or fatal */
-    while (!g_stop && !moq_pq_threaded_is_fatal(t))
-        moq_pq_threaded_wait(t, 500000);
+    int retry_count = 0;
+    int exit_code   = 0;
 
-    if (moq_pq_threaded_is_fatal(t))
-        fprintf(stderr, "PTZ: fatal (code=%llu)\n",
-                (unsigned long long)moq_pq_threaded_fatal_code(t));
+    for (;;) {
+        moq_pq_threaded_t *t = NULL;
+        moq_result_t rc = moq_pq_threaded_create(&tcfg, &t);
+        if (rc != MOQ_OK) {
+            fprintf(stderr, "moq_pq_threaded_create failed: %d\n", (int)rc);
+            exit_code = 1;
+            break;
+        }
+        g_threaded = t;
 
-    if (app.sub) moq_sub_destroy(app.sub);
-    moq_pq_threaded_stop(t);
-    moq_pq_threaded_destroy(t);
+        /* Block until stopped, fatal, or pump_exit (on_pump returned non-zero).
+           _wait returns MOQ_ERR_CLOSED on all three — pump_exit does NOT set
+           is_fatal, so we must check the return value to avoid spinning. */
+        while (!g_stop && !moq_pq_threaded_is_fatal(t)) {
+            if (moq_pq_threaded_wait(t, 500000) == MOQ_ERR_CLOSED) break;
+        }
+
+        bool     fatal  = moq_pq_threaded_is_fatal(t);
+        uint64_t fcode  = fatal ? moq_pq_threaded_fatal_code(t) : 0;
+        /* Retry on our timeout/rejection OR on any fatal/disconnect — whether
+           or not we were previously subscribed. Only user Ctrl-C skips retry. */
+        bool  do_retry  = !g_stop && (app.need_retry || fatal);
+
+        moq_pq_threaded_stop(t);
+        moq_pq_threaded_destroy(t);
+        g_threaded = NULL;
+
+        if (do_retry) {
+            /* Reset subscription state for the next attempt */
+            app.ns_sub            = MOQ_NS_SUB_HANDLE_INVALID;
+            app.sub               = MOQ_SUBSCRIPTION_INVALID;
+            app.ns_sub_ok         = false;
+            app.control_seen      = false;
+            app.subscribed        = false;
+            app.ns_subscribe_sent_us = 0;
+            app.subscribe_sent_us = 0;
+            app.need_retry        = false;
+
+            if (retry_count == 0)
+                fprintf(stderr, "PTZ: waiting for publisher ");
+            //fprintf(stderr, ".");
+            fflush(stderr);
+            app.dots_pending = true;
+            retry_count++;
+            sleep_ms(1000);
+            continue;
+        }
+
+        /* Clean newline after any dots before the final status line */
+        if (app.dots_pending)
+            fprintf(stderr, "\n");
+
+        if (fatal)
+            fprintf(stderr, "PTZ: fatal (code=%llu)\n", (unsigned long long)fcode);
+
+        break;
+    }
+
     q_stop(&app.q);
     pthread_join(worker, NULL);
 
     fprintf(stderr, "PTZ: %llu commands received\n", app.n_commands);
-    return 0;
+    return exit_code;
 }

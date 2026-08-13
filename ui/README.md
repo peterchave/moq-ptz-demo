@@ -1,25 +1,33 @@
-# PTZ Demo
+# PTZ Demo UI
 
+## What it does
 
-## User interface
+Browser-based playback and remote PTZ control over a MOQT connection.
+Built from the `examples/video` demo in `moq-playa`.
 
-Built from `examples/video` demo from `moq-playa`
-Enables playback + remote PTZ control over a MOQT connection
-
-### Run locally
+## Install
 
 ```sh
-npm install
-npm run dev
+pnpm install
 ```
-Open the local Vite URL in Chrome/Edge.
 
-### Query Params
-- `url`: Relay URL (default: `<origin>:4433`)
-- `ns`: Namespace root (default: `live`)
-- `hash`: Relay certificate SHA-256 hash (hex)
+## Run
+
+```sh
+pnpm dev
+```
+
+Open the local Vite URL in Chrome or Edge.
+
+## Query params
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `url` | `<origin>:4433` | Relay URL |
+| `ns`  | `live` | Namespace root |
+| `hash` | — | Relay certificate SHA-256 hash (hex) |
 
 Example:
-```text
-http://localhost:5173/index.html?url=https://moq.relay.example/moq-relay&ns=ptz-cam-1
+```
+http://localhost:5173/?url=https://moq.relay.example/moq-relay&ns=ptz-cam-1
 ```
