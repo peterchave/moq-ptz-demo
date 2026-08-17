@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@moqt/transport":    ["../cam-moq-ui/packages/transport/src/index.ts"],
+      "@moqt/webtransport": ["../cam-moq-ui/packages/webtransport/src/index.ts"],
+      "@moqt/msf":          ["../cam-moq-ui/packages/msf/src/index.ts"],
+      "@moqt/loc":          ["../cam-moq-ui/packages/loc/src/index.ts"]
+    }
+  },
+  "include": ["*.ts"]
+}

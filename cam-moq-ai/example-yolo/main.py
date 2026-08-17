@@ -5,7 +5,7 @@ from ultralytics import YOLO
 
 app = FastAPI(title="YOLO Object Detection API")
 
-# Load YOLO model on startup (yolov11l.pt will auto-download on first execution)
+# Load YOLO model on startup (yolov11k.pt will auto-download on first execution)
 model = YOLO("yolov11l.pt")
 
 @app.get("/")

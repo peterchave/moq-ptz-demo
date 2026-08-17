@@ -9,6 +9,7 @@ ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env}"
 
 # Load local secrets/config without committing them.
 if [ -f "$ENV_FILE" ]; then
+  echo "Using environment file: $ENV_FILE"
   set -a
   . "$ENV_FILE"
   set +a
