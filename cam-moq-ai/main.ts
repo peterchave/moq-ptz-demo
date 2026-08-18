@@ -17,7 +17,7 @@
  *   SUBSCRIBE_NAMESPACE Namespace to watch / subscribe  (default: live)
  *   PUBLISH_NAMESPACE   Namespace to publish on         (default: SUBSCRIBE_NAMESPACE)
  *   PUBLISH_TRACK       Output track name               (default: objects)
- *   YOLO_URL            YOLO predict endpoint           (default: http://172.236.249.14:8000/predict)
+ *   YOLO_URL            YOLO predict endpoint           (default: http://YOLO_SERVER_IP:8000/predict)
  *   CERT_HASH           Hex SHA-256 of relay TLS cert   (optional, 64 hex chars)
  *   DRAFT_VERSION       MoQT draft version: 14|16|18    (default: 16)
  */
@@ -37,7 +37,7 @@ const RELAY_URL = process.env['RELAY_URL']            ?? 'https://localhost:4443
 const SUB_NS    = process.env['SUBSCRIBE_NAMESPACE']  ?? 'live';
 const PUB_NS    = process.env['PUBLISH_NAMESPACE']    ?? SUB_NS;
 const PUB_TRACK = process.env['PUBLISH_TRACK']        ?? 'objects';
-const YOLO_URL  = process.env['YOLO_URL']             ?? 'http://172.236.249.14:8000/predict';
+const YOLO_URL  = process.env['YOLO_URL']             ?? 'http://YOLO_SERVER_IP:8000/predict';
 const CERT_HASH = process.env['CERT_HASH'];
 const DRAFT: 14 | 16 | 18 =
     process.env['DRAFT_VERSION'] === '14' ? 14 :

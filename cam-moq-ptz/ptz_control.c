@@ -22,7 +22,7 @@
  *   ptz_control <url> <namespace> [track] [options]
  *
  * Options:
- *   --cam-ip <ip>            camera IP (default: 192.168.1.105)
+ *   --cam-ip <ip>            camera IP (default: CAMERA_IP)
  *   --cam-user <user>        camera username (default: admin)
  *   --cam-pass <pass>        camera password
  *   --cam-speed <1-8>        default PTZ speed (default: 5)
@@ -550,7 +550,7 @@ int main(int argc, char **argv)
     }
 
     bool insecure = false;
-    cam_cfg_t cam = { "192.168.1.105", "admin", "", 5, 2000, "curl" };
+    cam_cfg_t cam = { "CAMERA_IP", "admin", "", 5, 2000, "curl" };
 
     static char nsbuf[256];
     snprintf(nsbuf, sizeof(nsbuf), "%s", argv[2]);
