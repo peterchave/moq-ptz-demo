@@ -25,11 +25,11 @@ Complete these steps: [moq5 install](MOQ5_INSTALL.md)
 
 | Package | Required by |
 |---------|------------|
-| OpenSSL | moq2ptz, vid2moq |
-| CMake ≥ 3.16 | moq2ptz, vid2moq |
-| ffmpeg | vid2moq (runtime, piped) |
-| curl | moq2ptz (runtime, camera CGI) |
-| Node.js + pnpm | ui |
+| OpenSSL | cam-moq-ptz, cam-moq-av |
+| CMake ≥ 3.16 | cam-moq-ptz, cam-moq-av |
+| ffmpeg | cam-moq-av (runtime, piped) |
+| curl | cam-moq-ptz (runtime, camera CGI) |
+| Node.js + pnpm | cam-moq-ui |
 
 ## Setup
 
@@ -44,8 +44,8 @@ cd ui && pnpm install && cd ..
 
 ## Typical flow
 1. Copy and configure `.env` in `cam-moq-ptz`, `cam-moq-av` and `cam-moq-ai` (`cp .env.example .env`).
-2. Start the PTZ command receiver: `cd am-moq-ptz && ./ptz_rx.sh`
-3. Start the video publisher: `cd am-moq-av && ./rtsp_tx.sh`
+2. Start the PTZ command receiver: `cd cam-moq-ptz && ./ptz_rx.sh`
+3. Start the video publisher: `cd cam-moq-av && ./rtsp_tx.sh`
 4. Start the inference adapter: `cd cam-moq-ai && ./moq_ai.sh`
 5. Start the UI: `cd cam-moq-ui && pnpm dev`
 6. Open the Vite URL in Chrome/Edge and connect to the same namespace: http://localhost:5173/simple/?url=RELAY_URL&ns=NAMESPACE
