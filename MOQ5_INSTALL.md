@@ -1,6 +1,6 @@
 # Install MOQ5 and dependancies
 
-From the **project root** (`ptz-demo-2/`):
+From the **project root** (`moq-ptz-demo/`):
 
 ```sh
 git clone https://github.com/openmoq/moq5
@@ -26,7 +26,11 @@ cd ..
 
 After cloning, your layout should look like:
 ```
-ptz-demo-2/
+moq-ptz-demo/
+  cam-moq-ai/
+  cam-moq-av/
+  cam-moq-ptz/
+  cam-moq-ui/
   moq5/
     thirdparty/
       picoquic/              ← picoquic source
@@ -36,10 +40,7 @@ ptz-demo-2/
       adapters/picoquic/     ← moq adapter libs
       core/                  ← moq-core
       service/               ← moq-service (endpoint + media sender)
-  moq2ptz/
-  vid2moq/
-  ui/
 ```
 
-This produces all static libraries that `vid2moq` and `moq2ptz` link against.
+This produces all static libraries that `cam-moq-av` and `cam-moq-ptz` link against.
 picotls libs are in `moq5/thirdparty/picotls/build/`; picoquic libs are in `moq5/build/_deps/picoquic/`.
