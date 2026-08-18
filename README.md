@@ -7,6 +7,10 @@ PTZ demo split into four subprojects:
 - [cam-moq-ptz](cam-moq-ptz/README.md): MOQT PTZ command receiver and camera control bridge.
 - [cam-moq-ai](cam-moq-ai/README.md): Inference adapter to process video feed.
 
+## Architecture
+
+![architecture.png](architecture.png)
+
 ## Prerequisites
 
 ### 1. moq5 + picoquic
@@ -15,7 +19,7 @@ Both `cam-moq-av` and `cam-moq-ptz` link against prebuilt [moq5](https://github.
 with its picoquic adapter. picoquic is **not bundled** in moq5 — clone it first, then build moq5
 with the adapter flags enabled.
 
-Complete these steps: [moq5 install](../MOQ5_INSTALL.md)
+Complete these steps: [moq5 install](MOQ5_INSTALL.md)
 
 ### 2. System packages
 
@@ -31,8 +35,8 @@ Complete these steps: [moq5 install](../MOQ5_INSTALL.md)
 
 ```sh
 # 1. Build C publishers/receivers
-cd vid2moq  && ./build.sh && cd ..
-cd moq2ptz  && ./build.sh && cd ..
+cd cam-moq-av  && ./build.sh && cd ..
+cd cam-moq-ptz  && ./build.sh && cd ..
 
 # 2. Install UI dependencies
 cd ui && pnpm install && cd ..
@@ -40,8 +44,8 @@ cd ui && pnpm install && cd ..
 
 ## Typical flow
 1. Copy and configure `.env` in `cam-moq-ptz`, `cam-moq-av` and `cam-moq-ai` (`cp .env.example .env`).
-2. Start the PTZ command receiver: `cd moq2ptz && ./ptz_rx.sh`
-3. Start the video publisher: `cd vid2moq && ./rtsp_tx.sh`
+2. Start the PTZ command receiver: `cd am-moq-ptz && ./ptz_rx.sh`
+3. Start the video publisher: `cd am-moq-av && ./rtsp_tx.sh`
 4. Start the inference adapter: `cd cam-moq-ai && ./moq_ai.sh`
 5. Start the UI: `cd cam-moq-ui && pnpm dev`
-6. Open the Vite URL in Chrome/Edge and connect to the same namespace: http://localhost:5173/simple/?url=<RELAY_URL>&ns=<NAMESPACE>
+6. Open the Vite URL in Chrome/Edge and connect to the same namespace: http://localhost:5173/simple/?url=RELAY_URL&ns=NAMESPACE
