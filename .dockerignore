@@ -1,0 +1,6 @@
+.git
+moq5
+**/node_modules
+**/build
+**/.env
+**/*.log

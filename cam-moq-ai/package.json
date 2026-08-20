@@ -7,7 +7,8 @@
   },
   "dependencies": {
     "@fails-components/webtransport": "^1.6.7",
-    "@fails-components/webtransport-transport-http3-quiche": "^1.6.7"
+    "@fails-components/webtransport-transport-http3-quiche": "^1.6.7",
+    "fast-json-patch": "^3.1.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
