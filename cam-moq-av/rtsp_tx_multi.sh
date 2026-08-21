@@ -10,6 +10,16 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
+TRACK_LOW="${TRACK_LOW:-${TRACK}-low}"
+TRACK_KEYFRAMES="${TRACK_KEYFRAMES:-${TRACK}-keyframes}"
+FPS_LOW="${FPS_LOW:-$FPS}"
+RTSP_URL_LOW="${RTSP_URL_LOW:-${RTSP_URL//subtype=0/subtype=1}}"
+
+# Hi-res is expensive: drop it soon after the last viewer leaves.
+# Low-res is cheap and is what viewers subscribe to first, so let it linger.
+IDLE_MS_HI="${IDLE_MS_HI:-5000}"
+IDLE_MS_LOW="${IDLE_MS_LOW:-60000}"
+
 echo "Configuration:"
 echo "  RTSP_URL: $RTSP_URL"
 echo "  RELAY: $RELAY"
@@ -21,65 +31,43 @@ echo "  FPS: $FPS"
 echo "  BITRATE: $BITRATE"
 echo "  CATALOG_KEEPALIVE_MS: $CATALOG_KEEPALIVE_MS"
 echo "  RTSP_URL_LOW: $RTSP_URL_LOW"
+echo "  TRACK_LOW: $TRACK_LOW"
 echo "  WIDTH_LOW: $WIDTH_LOW"
 echo "  HEIGHT_LOW: $HEIGHT_LOW"
 echo "  BITRATE_LOW: $BITRATE_LOW"
+echo "  TRACK_KEYFRAMES: $TRACK_KEYFRAMES"
+echo "  IDLE_MS_HI / IDLE_MS_LOW: $IDLE_MS_HI / $IDLE_MS_LOW"
 echo ""
 
-# Named pipe for the low-res stream.
-PIPE_LOW="$(mktemp -u /tmp/moq_low_XXXXXX)"
-rm -f "$PIPE_LOW"   # remove any stale pipe from a previous run
-mkfifo "$PIPE_LOW"
-
-cleanup() {
-    kill "$PID_LOW" 2>/dev/null
-    rm -f "$PIPE_LOW"
-}
-trap cleanup EXIT INT TERM
-
-# Low-res (subtype=1) → named pipe.
-ffmpeg \
-  -nostdin \
-  -y \
-  -rtsp_transport tcp \
-  -fflags nobuffer \
-  -flags low_delay \
-  -max_delay 0 \
-  -reorder_queue_size 0 \
-  -use_wallclock_as_timestamps 1 \
-  -analyzeduration 100000 \
-  -probesize 32768 \
-  -i "$RTSP_URL_LOW" \
-  -map 0:v:0 \
-  -an \
-  -c:v copy \
-  -bsf:v h264_mp4toannexb \
-  -f h264 "$PIPE_LOW" &
-PID_LOW=$!
-
-# High-res (subtype=0) → stdin of media_send.
-ffmpeg \
-  -nostdin \
-  -rtsp_transport tcp \
-  -fflags nobuffer \
-  -flags low_delay \
-  -max_delay 0 \
-  -reorder_queue_size 0 \
-  -use_wallclock_as_timestamps 1 \
-  -analyzeduration 100000 \
-  -probesize 32768 \
-  -i "$RTSP_URL" \
-  -map 0:v:0 \
-  -an \
-  -c:v copy \
-  -bsf:v h264_mp4toannexb \
-  -f h264 pipe:1 | \
-"$SCRIPT_DIR/build/media_send" \
+# Two independent sources, each with its own ffmpeg child and lifecycle.
+# The keyframe sidecar shares the hi-res source, so demand on it keeps hi-res up.
+exec "$SCRIPT_DIR/build/media_send" \
   "$RELAY" \
   "$NAMESPACE" \
-  "$TRACK" \
-  --width "$WIDTH" --height "$HEIGHT" --fps "$FPS" --bitrate "$BITRATE" \
   --catalog-keepalive-ms "$CATALOG_KEEPALIVE_MS" \
-  --pipe "$TRACK_LOW" "$PIPE_LOW" "$WIDTH_LOW" "$HEIGHT_LOW" "$FPS_LOW" "$BITRATE_LOW" \
-  --keyframe-track "$TRACK_KEYFRAMES" \
-  --insecure-skip-verify
+  --insecure-skip-verify \
+  --source hi  --rtsp "$RTSP_URL"     --idle-ms "$IDLE_MS_HI" \
+  --source low --rtsp "$RTSP_URL_LOW" --idle-ms "$IDLE_MS_LOW" \
+  --track "$TRACK" --from hi \
+    --width "$WIDTH" --height "$HEIGHT" --fps "$FPS" --bitrate "$BITRATE" \
+  --track "$TRACK_LOW" --from low \
+    --width "$WIDTH_LOW" --height "$HEIGHT_LOW" --fps "$FPS_LOW" --bitrate "$BITRATE_LOW" \
+  --track "$TRACK_KEYFRAMES" --from hi --keyframes-only \
+    --width "$WIDTH" --height "$HEIGHT" --bitrate "$BITRATE"
+
+
+exit 0
+
+exec "$SCRIPT_DIR/build/media_send" \
+  "$RELAY" \
+  "$NAMESPACE" \
+  --catalog-keepalive-ms "$CATALOG_KEEPALIVE_MS" \
+  --insecure-skip-verify \
+  --source hi  --rtsp "$RTSP_URL"     --idle-ms "$IDLE_MS_HI" \
+  --source low --rtsp "$RTSP_URL_LOW" --idle-ms "$IDLE_MS_LOW" \
+  --track "$TRACK" --from hi \
+    --width "$WIDTH" --height "$HEIGHT" --fps "$FPS" --bitrate "$BITRATE" \
+  --track "$TRACK_LOW" --from low \
+    --width "$WIDTH_LOW" --height "$HEIGHT_LOW" --fps "$FPS_LOW" --bitrate "$BITRATE_LOW" \
+  --track "$TRACK_KEYFRAMES" --from hi --keyframes-only \
+    --width "$WIDTH" --height "$HEIGHT" --bitrate "$BITRATE"

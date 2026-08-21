@@ -11,6 +11,8 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
+IDLE_MS="${IDLE_MS:-5000}"
+
 echo "Configuration:"
 echo "  RTSP_URL: $RTSP_URL"
 echo "  RELAY: $RELAY"
@@ -21,28 +23,16 @@ echo "  HEIGHT: $HEIGHT"
 echo "  FPS: $FPS"
 echo "  BITRATE: $BITRATE"
 echo "  CATALOG_KEEPALIVE_MS: $CATALOG_KEEPALIVE_MS"
+echo "  IDLE_MS: $IDLE_MS"
 echo ""
 
-ffmpeg \
-  -rtsp_transport tcp \
-  -fflags nobuffer \
-  -flags low_delay \
-  -max_delay 0 \
-  -reorder_queue_size 0 \
-  -use_wallclock_as_timestamps 1 \
-  -analyzeduration 100000 \
-  -probesize 32768 \
-  -i "$RTSP_URL" \
-  -map 0:v:0 \
-  -an \
-  -c:v copy \
-  -bsf:v h264_mp4toannexb \
-  -f h264 pipe:1 | \
-"$SCRIPT_DIR/build/media_send" \
+# media_send announces the namespace immediately and pulls from the camera only
+# while a subscriber is attached.
+exec "$SCRIPT_DIR/build/media_send" \
   "$RELAY" \
   "$NAMESPACE" \
-  "$TRACK" \
-  --width "$WIDTH" --height "$HEIGHT" --fps "$FPS" --bitrate "$BITRATE" \
   --catalog-keepalive-ms "$CATALOG_KEEPALIVE_MS" \
-  --insecure-skip-verify
-
+  --insecure-skip-verify \
+  --source cam --rtsp "$RTSP_URL" --idle-ms "$IDLE_MS" \
+  --track "$TRACK" --from cam \
+    --width "$WIDTH" --height "$HEIGHT" --fps "$FPS" --bitrate "$BITRATE"

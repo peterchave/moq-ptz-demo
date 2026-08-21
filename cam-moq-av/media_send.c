@@ -1,22 +1,36 @@
 /*
- * media_send — Annex-B H.264 sender for ptz-remote.
+ * media_send — on-demand Annex-B H.264 publisher for ptz-remote.
  *
- * Reads Annex-B H.264 from stdin, splits into access units, and publishes
- * each access unit as one RAW/LOC media object.
+ * Announces a namespace and its catalog immediately, but ingests video only
+ * while a subscriber exists. Each *source* owns one ffmpeg child process
+ * pulling one RTSP stream; each source feeds one or more MOQ *tracks*. A
+ * supervisor loop starts a source when any of its tracks gains demand and
+ * stops it once demand has been absent for the source's idle timeout.
  *
  * Usage:
- *   media_send <url> <namespace> [track] [options]
+ *   media_send <url> <namespace> [options]
  *
- * Options:
- *   --insecure-skip-verify   disable TLS certificate verification
- *   --fps N                  frame rate metadata and PTS step (default 30)
- *   --width N                video width metadata (default 0)
- *   --height N               video height metadata (default 0)
- *   --framerate N            catalog framerate override (default fps)
- *   --bitrate N              max bitrate bits/s (default 1500000)
- *   --catalog-keepalive-ms N catalog refresh interval in ms (0 disables)
- *   --pipe ...               optional extra video tracks from named pipes
- *   --keyframe-track <name>  optional keyframe-only sidecar track
+ * Global options:
+ *   --insecure-skip-verify        disable TLS certificate verification
+ *   --catalog-keepalive-ms N      catalog refresh interval in ms (0 disables)
+ *   --ffmpeg <path>               ffmpeg binary (default "ffmpeg")
+ *
+ * Source options (apply to the most recent --source):
+ *   --source <name>               begin a source definition
+ *   --rtsp <url>                  RTSP input; media_send spawns/kills ffmpeg
+ *   --fifo <path>                 read Annex-B from an external named pipe
+ *   --stdin                       read Annex-B from stdin
+ *   --idle-ms N                   linger after last unsubscribe (default 5000)
+ *   --always-on                   ignore demand; keep the source running
+ *   --warm-with <source>          also run this source while <source> has demand
+ *
+ * Track options (apply to the most recent --track):
+ *   --track <name>                begin a track definition
+ *   --from <source>               source feeding this track (default: first)
+ *   --width N / --height N        video dimensions for the catalog
+ *   --fps N                       catalog framerate (default 30)
+ *   --bitrate N                   max bitrate bits/s (default 1500000)
+ *   --keyframes-only              publish only sync samples (sidecar track)
  */
 
 #include <moq/endpoint.h>
@@ -26,6 +40,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -35,21 +52,91 @@
 #include <string.h>
 #include <time.h>
 
+extern char **environ;
+
 static volatile sig_atomic_t g_stop = 0;
-enum { ENDPOINT_DRAIN_TIMEOUT_US = 5000000 };
 
-/* ── Extra-track definitions ─────────────────────────────────────────── */
+enum {
+    ENDPOINT_DRAIN_TIMEOUT_US = 5000000,
+    SUPERVISOR_TICK_US        = 100000,   /* demand poll / lifecycle cadence */
+    TERM_GRACE_US             = 2000000,  /* SIGTERM -> SIGKILL grace */
+    BACKOFF_BASE_US           = 500000,
+    BACKOFF_MAX_US            = 30000000,
+    HEALTHY_RUN_US            = 30000000, /* run this long -> reset backoff */
+    DEFAULT_IDLE_US           = 5000000,
+    QUEUE_SECONDS             = 2,        /* shared send-ring depth, in seconds */
+    QUEUE_MIN_OBJECTS         = 32
+};
 
-#define MAX_EXTRA_TRACKS 8
+#define MAX_SOURCES 8
+#define MAX_TRACKS  16
+
+typedef enum {
+    SRC_INPUT_SPAWN,   /* media_send owns an ffmpeg child */
+    SRC_INPUT_FIFO,    /* external producer writes a named pipe */
+    SRC_INPUT_STDIN    /* external producer pipes into stdin */
+} src_input_t;
+
+typedef enum {
+    SRC_IDLE,      /* no process, no reader thread */
+    SRC_RUNNING,
+    SRC_STOPPING   /* SIGTERM sent, waiting for exit + reader join */
+} src_state_t;
+
+typedef struct track_s track_t;
 
 typedef struct {
+    /* configuration */
     const char *name;
-    const char *path;
+    src_input_t input;
+    const char *rtsp_url;
+    const char *fifo_path;
+    uint64_t    idle_us;
+    bool        always_on;
+    const char *warm_with;
+
+    /* bound tracks */
+    track_t *tracks[MAX_TRACKS];
+    int      n_tracks;
+
+    /* runtime */
+    src_state_t state;
+    pid_t       pid;
+    int         read_fd;
+    pthread_t   thread;
+    bool        thread_live;
+    volatile sig_atomic_t reader_stop;
+    volatile sig_atomic_t reader_done;
+    uint64_t    started_us;
+    uint64_t    idle_deadline_us;
+    uint64_t    kill_deadline_us;
+    uint64_t    backoff_until_us;
+    unsigned    failures;
+    unsigned long long objects_sent;
+
+    struct app_s *app;
+} source_t;
+
+struct track_s {
+    const char *name;
+    const char *from;        /* source name, resolved to src at setup */
+    source_t   *src;
     uint32_t    width;
     uint32_t    height;
     uint32_t    fps;
     uint64_t    bitrate;
-} extra_def_t;
+    bool        keyframes_only;
+    moq_media_track_t *handle;
+};
+
+typedef struct app_s {
+    moq_media_sender_t *tx;
+    source_t sources[MAX_SOURCES];
+    int      n_sources;
+    track_t  tracks[MAX_TRACKS];
+    int      n_tracks;
+    const char *ffmpeg_bin;
+} app_t;
 
 static void on_signal(int sig)
 {
@@ -118,10 +205,18 @@ static void vec_free(byte_vec_t *v)
     v->cap = 0;
 }
 
-static bool ensure_bytes(FILE *in, byte_vec_t *buf, size_t need)
+/* Stop predicate shared by the blocking read helpers: either the process is
+ * shutting down or this source alone is being torn down. */
+static bool halted(const volatile sig_atomic_t *stop)
+{
+    return g_stop || (stop && *stop);
+}
+
+static bool ensure_bytes(FILE *in, byte_vec_t *buf, size_t need,
+                         const volatile sig_atomic_t *stop)
 {
     uint8_t tmp[4096];
-    while (!g_stop && buf->len < need) {
+    while (!halted(stop) && buf->len < need) {
         size_t n = fread(tmp, 1, sizeof(tmp), in);
         if (n == 0) {
             /* For optional FIFO tracks opened O_NONBLOCK, "no data yet" is
@@ -237,13 +332,14 @@ static void h264_reader_free(h264_annexb_reader_t *r)
 static bool read_h264_access_unit(FILE *in,
                                   h264_annexb_reader_t *r,
                                   byte_vec_t *out_au,
-                                  bool *is_keyframe)
+                                  bool *is_keyframe,
+                                  const volatile sig_atomic_t *stop)
 {
     vec_reset(out_au);
     *is_keyframe = false;
 
-    while (!g_stop) {
-        if (!ensure_bytes(in, &r->pending, 6)) {
+    while (!halted(stop)) {
+        if (!ensure_bytes(in, &r->pending, 6, stop)) {
             if (out_au->len > 0) {
                 *is_keyframe = r->current_is_keyframe;
                 r->have_vcl = false;
@@ -364,77 +460,122 @@ static uint64_t realtime_time_us(void)
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000ull);
 }
 
-/* ── Named-pipe reader thread ────────────────────────────────────────── */
-
-typedef struct {
-    moq_media_sender_t *tx;
-    moq_media_track_t  *track;
-    const char         *name;
-    const char         *path;
-    uint32_t            fps;
-} pipe_track_t;
-
-static void *pipe_track_reader(void *arg)
+static uint64_t monotonic_time_us(void)
 {
-    pipe_track_t *pt = (pipe_track_t *)arg;
-    /* Open the FIFO without blocking so Ctrl-C can always escape.
-     * fopen(O_RDONLY) on a FIFO blocks until a writer appears, which
-     * makes pthread_join hang if the writer never opens (e.g. ffmpeg
-     * exited with an error).  Use O_NONBLOCK to poll instead. */
-    int _fd = -1;
-    while (!g_stop) {
-        _fd = open(pt->path, O_RDONLY | O_NONBLOCK);
-        if (_fd >= 0) break;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000ull);
+}
+
+/* One epoch for every source, so timestamps stay comparable across tracks and
+ * across on-demand restarts (a per-source frame counter would reset to zero and
+ * make an idle gap look like no time had passed). */
+static uint64_t g_epoch_us;
+
+static uint64_t stream_time_us(void)
+{
+    uint64_t now = monotonic_time_us();
+    return now > g_epoch_us ? now - g_epoch_us : 0;
+}
+
+/* ── Per-source ingest thread ────────────────────────────────────────── */
+
+/* Open the source's byte stream. SPAWN sources inherit the pipe fd the
+ * supervisor already created; FIFO sources poll until a writer appears. */
+static FILE *source_open(source_t *s)
+{
+    if (s->input == SRC_INPUT_STDIN)
+        return stdin;
+
+    if (s->input == SRC_INPUT_SPAWN) {
+        FILE *in = fdopen(s->read_fd, "rb");
+        if (!in) {
+            fprintf(stderr, "source '%s': fdopen: %s\n", s->name, strerror(errno));
+            close(s->read_fd);
+        }
+        s->read_fd = -1;
+        return in;
+    }
+
+    /* FIFO: opening O_RDONLY blocks until a writer arrives, which would make
+     * the join at shutdown hang. Poll with O_NONBLOCK instead. */
+    int fd = -1;
+    while (!halted(&s->reader_stop)) {
+        fd = open(s->fifo_path, O_RDONLY | O_NONBLOCK);
+        if (fd >= 0)
+            break;
         if (errno == ENXIO || errno == ENOENT) {
-            /* No writer yet (ENXIO on macOS/Linux for FIFO w/o writer) */
             usleep(100000);
             continue;
         }
-        fprintf(stderr, "track '%s': open '%s': %s\n",
-                pt->name, pt->path, strerror(errno));
+        fprintf(stderr, "source '%s': open '%s': %s\n",
+                s->name, s->fifo_path, strerror(errno));
         return NULL;
     }
-    if (_fd < 0) return NULL;  /* g_stop was set before writer appeared */
+    if (fd < 0)
+        return NULL;
 
-    FILE *in = fdopen(_fd, "rb");
+    FILE *in = fdopen(fd, "rb");
     if (!in) {
-        close(_fd);
-        fprintf(stderr, "track '%s': fdopen '%s': %s\n",
-                pt->name, pt->path, strerror(errno));
-        return NULL;
+        fprintf(stderr, "source '%s': fdopen '%s': %s\n",
+                s->name, s->fifo_path, strerror(errno));
+        close(fd);
     }
+    return in;
+}
 
-    h264_annexb_reader_t reader;
-    h264_reader_init(&reader);
-    byte_vec_t au = {0};
-    uint64_t frame_index = 0;
-    bool started = false;
-    const uint64_t frame_dur = pt->fps ? 1000000ull / pt->fps : 33333ull;
+/* A track takes this access unit only when it wants it AND someone is watching.
+ * The sender's send queue is one ring shared by every track, drained in strict
+ * order, and an entry for a track with no subscriber holds the head -- so
+ * enqueueing for an unwatched track stalls every other track behind it. */
+static bool track_accepts(const app_t *app, const track_t *t, bool keyframe)
+{
+    if (t->keyframes_only && !keyframe)
+        return false;
+    return moq_media_sender_track_has_subscriber(app->tx, t->handle);
+}
 
-    while (!g_stop) {
-        bool keyframe = false;
-        if (!read_h264_access_unit(in, &reader, &au, &keyframe))
-            break;
-        if (au.len == 0)
+/* Publish one access unit to every track fed by this source. The payload is
+ * shared: each write consumes exactly one reference, so pre-charge the
+ * refcount to the number of writes we are about to attempt. */
+static bool source_publish(source_t *s, const byte_vec_t *au, bool keyframe)
+{
+    /* Snapshot the decision: demand can change under us, and the refcount we
+     * pre-charge below must match the number of writes exactly. */
+    bool accept[MAX_TRACKS];
+    int writers = 0;
+    for (int i = 0; i < s->n_tracks; i++) {
+        accept[i] = track_accepts(s->app, s->tracks[i], keyframe);
+        if (accept[i])
+            writers++;
+    }
+    if (writers == 0)
+        return true;
+
+    uint8_t *owned = (uint8_t *)malloc(au->len);
+    if (!owned)
+        return false;
+    memcpy(owned, au->data, au->len);
+
+    moq_rcbuf_t *payload = NULL;
+    if (moq_rcbuf_wrap(moq_alloc_default(), owned, au->len,
+                       payload_release, NULL, &payload) != MOQ_OK) {
+        free(owned);
+        return false;
+    }
+    for (int i = 1; i < writers; i++)
+        moq_rcbuf_incref(payload);
+
+    int refs_held = writers;
+    uint64_t pts = stream_time_us();
+    uint64_t capture = realtime_time_us();
+    bool ok = true;
+
+    for (int i = 0; i < s->n_tracks && refs_held > 0; i++) {
+        track_t *t = s->tracks[i];
+        if (!accept[i])
             continue;
-        if (!started) {
-            if (!keyframe)
-                continue;
-            started = true;
-            fprintf(stderr, "track '%s': first keyframe; starting publish\n", pt->name);
-        }
-
-        uint8_t *owned = (uint8_t *)malloc(au.len);
-        if (!owned)
-            break;
-        memcpy(owned, au.data, au.len);
-
-        moq_rcbuf_t *payload = NULL;
-        if (moq_rcbuf_wrap(moq_alloc_default(), owned, au.len,
-                           payload_release, NULL, &payload) != MOQ_OK) {
-            free(owned);
-            break;
-        }
 
         moq_media_send_object_t o;
         memset(&o, 0, sizeof(o));
@@ -442,46 +583,411 @@ static void *pipe_track_reader(void *arg)
         o.payload              = payload;
         o.is_sync              = keyframe;
         o.starts_group         = keyframe;
-        o.presentation_time_us = frame_index * frame_dur;
-        o.decode_time_us       = frame_index * frame_dur;
+        o.presentation_time_us = pts;
+        o.decode_time_us       = pts;
         o.has_capture_time     = true;
-        o.capture_time_us      = realtime_time_us();
+        o.capture_time_us      = capture;
 
-        moq_result_t wr = moq_media_sender_write(pt->tx, pt->track, &o);
+        moq_result_t wr = moq_media_sender_write(s->app->tx, t->handle, &o);
+        refs_held--;
         if (wr == MOQ_OK) {
-            frame_index++;
-        } else if (wr == MOQ_ERR_WOULD_BLOCK) {
-            moq_rcbuf_decref(payload);
-        } else {
-            moq_rcbuf_decref(payload);
-            if (wr != MOQ_ERR_INTERRUPTED && wr != MOQ_ERR_CLOSED)
-                fprintf(stderr, "track '%s' write failed: %d\n", pt->name, (int)wr);
+            s->objects_sent++;
+            continue;
+        }
+        moq_rcbuf_decref(payload);
+        if (wr == MOQ_ERR_WOULD_BLOCK)
+            continue;   /* transient: the send queue is full, drop this object */
+        if (wr != MOQ_ERR_INTERRUPTED && wr != MOQ_ERR_CLOSED)
+            fprintf(stderr, "track '%s' write failed: %d\n", t->name, (int)wr);
+        ok = false;
+        break;
+    }
+
+    while (refs_held-- > 0)
+        moq_rcbuf_decref(payload);
+    return ok;
+}
+
+static void *source_reader(void *arg)
+{
+    source_t *s = (source_t *)arg;
+
+    FILE *in = source_open(s);
+    if (!in) {
+        s->reader_done = 1;
+        return NULL;
+    }
+
+    h264_annexb_reader_t reader;
+    h264_reader_init(&reader);
+    byte_vec_t au = {0};
+    bool started = false;
+
+    while (!halted(&s->reader_stop)) {
+        bool keyframe = false;
+        if (!read_h264_access_unit(in, &reader, &au, &keyframe, &s->reader_stop))
+            break;
+        if (au.len == 0)
+            continue;
+        if (!started) {
+            if (!keyframe)
+                continue;   /* a subscriber can only decode from an IDR */
+            started = true;
+            fprintf(stderr, "source '%s': first keyframe; publishing\n", s->name);
+        }
+        if (!source_publish(s, &au, keyframe))
+            break;
+    }
+
+    if (in != stdin)
+        fclose(in);
+    h264_reader_free(&reader);
+    vec_free(&au);
+    s->reader_done = 1;
+    return NULL;
+}
+
+/* ── ffmpeg child lifecycle ──────────────────────────────────────────── */
+
+static bool source_spawn_ffmpeg(source_t *s)
+{
+    int fds[2];
+    if (pipe(fds) != 0) {
+        fprintf(stderr, "source '%s': pipe: %s\n", s->name, strerror(errno));
+        return false;
+    }
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    posix_spawn_file_actions_addclose(&fa, fds[1]);
+
+    posix_spawnattr_t at;
+    posix_spawnattr_init(&at);
+    /* Own process group: the supervisor signals -pgid so one source's teardown
+     * can never reach a sibling ffmpeg. */
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&at, 0);
+
+    /* argv, never a shell command string: the RTSP URL carries credentials and
+     * arbitrary query characters. */
+    char *argv[] = {
+        (char *)"ffmpeg",
+        (char *)"-nostdin",
+        (char *)"-loglevel", (char *)"warning",
+        (char *)"-rtsp_transport", (char *)"tcp",
+        (char *)"-fflags", (char *)"nobuffer",
+        (char *)"-flags", (char *)"low_delay",
+        (char *)"-max_delay", (char *)"0",
+        (char *)"-reorder_queue_size", (char *)"0",
+        (char *)"-use_wallclock_as_timestamps", (char *)"1",
+        (char *)"-analyzeduration", (char *)"100000",
+        (char *)"-probesize", (char *)"32768",
+        (char *)"-i", (char *)s->rtsp_url,
+        (char *)"-map", (char *)"0:v:0",
+        (char *)"-an",
+        (char *)"-c:v", (char *)"copy",
+        (char *)"-bsf:v", (char *)"h264_mp4toannexb",
+        (char *)"-f", (char *)"h264", (char *)"pipe:1",
+        NULL
+    };
+
+    pid_t pid = -1;
+    int rc = posix_spawnp(&pid, s->app->ffmpeg_bin, &fa, &at, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&at);
+    close(fds[1]);
+
+    if (rc != 0) {
+        close(fds[0]);
+        fprintf(stderr, "source '%s': spawn %s: %s\n",
+                s->name, s->app->ffmpeg_bin, strerror(rc));
+        return false;
+    }
+
+    s->pid = pid;
+    s->read_fd = fds[0];
+    return true;
+}
+
+static bool source_start(source_t *s)
+{
+    s->reader_stop = 0;
+    s->reader_done = 0;
+    s->objects_sent = 0;
+    s->idle_deadline_us = 0;
+    s->read_fd = -1;
+    s->pid = -1;
+
+    if (s->input == SRC_INPUT_SPAWN && !source_spawn_ffmpeg(s))
+        return false;
+
+    if (pthread_create(&s->thread, NULL, source_reader, s) != 0) {
+        fprintf(stderr, "source '%s': pthread_create failed\n", s->name);
+        if (s->pid > 0)
+            kill(-s->pid, SIGKILL);
+        if (s->read_fd >= 0)
+            close(s->read_fd);
+        return false;
+    }
+
+    s->thread_live = true;
+    s->started_us = monotonic_time_us();
+    s->state = SRC_RUNNING;
+    fprintf(stderr, "source '%s': started\n", s->name);
+    return true;
+}
+
+/* Ask the source to wind down. For a spawned source, killing ffmpeg closes the
+ * pipe and the reader ends on EOF; setting the stop flag first would close the
+ * read end under ffmpeg and make it log a broken pipe on the way out. The flag
+ * is only needed where there is no child to kill. */
+static void source_begin_stop(source_t *s)
+{
+    if (s->state != SRC_RUNNING)
+        return;
+    if (s->pid > 0)
+        kill(-s->pid, SIGTERM);
+    else
+        s->reader_stop = 1;
+    s->kill_deadline_us = monotonic_time_us() + TERM_GRACE_US;
+    s->state = SRC_STOPPING;
+    fprintf(stderr, "source '%s': stopping (%llu objects)\n",
+            s->name, s->objects_sent);
+}
+
+/* True once the child is reaped and the reader thread has been joined. */
+static bool source_settle(source_t *s)
+{
+    if (s->pid > 0) {
+        int st = 0;
+        pid_t r = waitpid(s->pid, &st, WNOHANG);
+        if (r == 0) {
+            if (monotonic_time_us() >= s->kill_deadline_us) {
+                s->reader_stop = 1;
+                kill(-s->pid, SIGKILL);
+            }
+            return false;
+        }
+        if (r < 0 && errno == EINTR)
+            return false;
+        s->pid = -1;
+    }
+    if (!s->reader_done)
+        return false;
+    if (s->thread_live) {
+        pthread_join(s->thread, NULL);
+        s->thread_live = false;
+    }
+    s->state = SRC_IDLE;
+    return true;
+}
+
+/* The reader ended on its own: ffmpeg died, the camera dropped, or the fifo
+ * writer went away. Distinguish that from a demand-driven stop so a flapping
+ * source backs off instead of hammering the camera. */
+static void source_handle_failure(source_t *s)
+{
+    uint64_t now = monotonic_time_us();
+    bool healthy = now - s->started_us >= HEALTHY_RUN_US;
+
+    s->reader_stop = 1;
+    if (s->pid > 0)
+        kill(-s->pid, SIGTERM);
+    s->kill_deadline_us = now + TERM_GRACE_US;
+    s->state = SRC_STOPPING;
+
+    if (healthy)
+        s->failures = 0;
+    s->failures++;
+
+    uint64_t backoff = BACKOFF_BASE_US;
+    for (unsigned i = 1; i < s->failures && backoff < BACKOFF_MAX_US; i++)
+        backoff *= 2;
+    if (backoff > BACKOFF_MAX_US)
+        backoff = BACKOFF_MAX_US;
+    s->backoff_until_us = now + backoff;
+
+    fprintf(stderr, "source '%s': input ended unexpectedly (failure %u); "
+                    "retrying in %llums if demand persists\n",
+            s->name, s->failures, (unsigned long long)(backoff / 1000));
+}
+
+/* ── Demand-driven supervisor ────────────────────────────────────────── */
+
+static size_t source_demand(const app_t *app, const source_t *s)
+{
+    size_t n = 0;
+    for (int i = 0; i < s->n_tracks; i++)
+        n += moq_media_sender_track_subscriptions(app->tx, s->tracks[i]->handle);
+    return n;
+}
+
+/* A source is wanted when it has its own demand, when it is pinned always-on,
+ * or when another source it warms is in demand (so a quality switch does not
+ * pay an RTSP connect plus a GOP). */
+static bool source_wanted(const app_t *app, const source_t *s)
+{
+    if (s->always_on)
+        return true;
+    if (source_demand(app, s) > 0)
+        return true;
+    for (int i = 0; i < app->n_sources; i++) {
+        const source_t *o = &app->sources[i];
+        if (o != s && o->warm_with && strcmp(o->warm_with, s->name) == 0 &&
+            source_demand(app, o) > 0)
+            return true;
+    }
+    return false;
+}
+
+static void supervisor_tick(app_t *app)
+{
+    uint64_t now = monotonic_time_us();
+
+    for (int i = 0; i < app->n_sources; i++) {
+        source_t *s = &app->sources[i];
+        bool wanted = !g_stop && source_wanted(app, s);
+
+        switch (s->state) {
+        case SRC_IDLE:
+            if (wanted && now >= s->backoff_until_us && !source_start(s))
+                s->backoff_until_us = now + BACKOFF_BASE_US;
+            break;
+
+        case SRC_RUNNING:
+            if (s->reader_done) {
+                if (s->input == SRC_INPUT_STDIN) {
+                    /* stdin cannot be reopened; treat EOF as end of process. */
+                    fprintf(stderr, "source '%s': stdin closed; shutting down\n",
+                            s->name);
+                    g_stop = 1;
+                    source_begin_stop(s);
+                } else {
+                    source_handle_failure(s);
+                }
+            } else if (!wanted) {
+                if (s->idle_deadline_us == 0) {
+                    s->idle_deadline_us = now + s->idle_us;
+                    fprintf(stderr, "source '%s': no demand; stopping in %llums\n",
+                            s->name, (unsigned long long)(s->idle_us / 1000));
+                } else if (now >= s->idle_deadline_us) {
+                    source_begin_stop(s);
+                }
+            } else if (s->idle_deadline_us != 0) {
+                s->idle_deadline_us = 0;
+                fprintf(stderr, "source '%s': demand returned; staying up\n", s->name);
+            }
+            break;
+
+        case SRC_STOPPING:
+            source_settle(s);
             break;
         }
     }
+}
 
-    fclose(in);
-    h264_reader_free(&reader);
-    vec_free(&au);
+static void supervisor_shutdown(app_t *app)
+{
+    for (int i = 0; i < app->n_sources; i++)
+        source_begin_stop(&app->sources[i]);
+
+    for (int i = 0; i < app->n_sources; i++) {
+        source_t *s = &app->sources[i];
+        while (s->state == SRC_STOPPING && !source_settle(s))
+            usleep(20000);
+    }
+}
+
+/* ── Demand callbacks ────────────────────────────────────────────────── */
+
+/* Network-thread callbacks: log only. They must not touch sender mutators, and
+ * the supervisor re-reads the authoritative counts each tick anyway. */
+static void on_subscriber_joined(void *ctx, moq_media_sender_t *sender,
+                                 moq_media_track_t *track, size_t active)
+{
+    app_t *app = (app_t *)ctx;
+    (void)sender;
+    for (int i = 0; i < app->n_tracks; i++) {
+        if (app->tracks[i].handle == track) {
+            fprintf(stderr, "demand: +1 track '%s' (%zu active)\n",
+                    app->tracks[i].name, active);
+            return;
+        }
+    }
+}
+
+static void on_subscriber_left(void *ctx, moq_media_sender_t *sender,
+                               moq_media_track_t *track, size_t active)
+{
+    app_t *app = (app_t *)ctx;
+    (void)sender;
+    for (int i = 0; i < app->n_tracks; i++) {
+        if (app->tracks[i].handle == track) {
+            fprintf(stderr, "demand: -1 track '%s' (%zu active)\n",
+                    app->tracks[i].name, active);
+            return;
+        }
+    }
+}
+
+/* ── CLI ─────────────────────────────────────────────────────────────── */
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "usage: %s <url> <namespace> [global options] [source/track definitions]\n"
+        "\n"
+        "global:\n"
+        "  --insecure-skip-verify        disable TLS certificate verification\n"
+        "  --catalog-keepalive-ms N      catalog refresh interval in ms (0 disables)\n"
+        "  --ffmpeg <path>               ffmpeg binary (default \"ffmpeg\")\n"
+        "  --queue-objects N             shared send-queue depth (0 = 2s of media)\n"
+        "  --stats-ms N                  log sender stats every N ms (0 = off)\n"
+        "\n"
+        "source (repeatable; options apply to the preceding --source):\n"
+        "  --source <name>               begin a source definition\n"
+        "  --rtsp <url>                  RTSP input; media_send runs ffmpeg on demand\n"
+        "  --fifo <path>                 read Annex-B from an external named pipe\n"
+        "  --stdin                       read Annex-B from stdin\n"
+        "  --idle-ms N                   linger after last unsubscribe (default 5000)\n"
+        "  --always-on                   ignore demand; keep the source running\n"
+        "  --warm-with <source>          run this source while <source> has demand\n"
+        "\n"
+        "track (repeatable; options apply to the preceding --track):\n"
+        "  --track <name>                begin a track definition\n"
+        "  --from <source>               source feeding this track (default: first)\n"
+        "  --width N  --height N         catalog dimensions\n"
+        "  --fps N                       catalog framerate (default 30)\n"
+        "  --bitrate N                   max bitrate bits/s (default 1500000)\n"
+        "  --keyframes-only              publish only sync samples\n",
+        prog);
+}
+
+static const char *need_arg(int argc, char **argv, int *i, const char *flag)
+{
+    if (*i + 1 >= argc) {
+        fprintf(stderr, "%s requires a value\n", flag);
+        exit(2);
+    }
+    return argv[++(*i)];
+}
+
+static source_t *find_source(app_t *app, const char *name)
+{
+    for (int i = 0; i < app->n_sources; i++) {
+        if (strcmp(app->sources[i].name, name) == 0)
+            return &app->sources[i];
+    }
     return NULL;
 }
 
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        fprintf(stderr,
-                "usage: %s <url> <namespace> [track] [options]\n"
-                "  --insecure-skip-verify        disable TLS certificate verification\n"
-                "  --fps N                       frame rate (default 30)\n"
-                "  --width N                     video width in pixels (default 0)\n"
-                "  --height N                    video height in pixels (default 0)\n"
-                "  --framerate N                 catalog framerate override (default fps)\n"
-                "  --bitrate N                   max bitrate bits/s (default 1500000)\n"
-                "  --catalog-keepalive-ms N      catalog refresh interval in ms (0 disables)\n"
-                "  --pipe <name> <path> <w> <h> <fps> <bps>\n"
-                "                                extra track from named pipe\n"
-                "  --keyframe-track <name>       sidecar track: keyframes from stdin source\n",
-                argv[0]);
+        usage(argv[0]);
         return 2;
     }
 
@@ -491,68 +997,146 @@ int main(int argc, char **argv)
     moq_bytes_t ns_parts[32];
     size_t ns_count = split_namespace(nsbuf, ns_parts, 32);
 
-    const char *track = "video";
-    bool insecure_skip_verify = false;
-    uint32_t fps = 30;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t framerate = 0;
-    uint64_t bitrate = 1500000;
-    bool has_catalog_keepalive_ms = false;
-    uint64_t catalog_keepalive_ms = 0;
+    app_t app;
+    memset(&app, 0, sizeof(app));
+    app.ffmpeg_bin = "ffmpeg";
 
-    extra_def_t  extra_defs[MAX_EXTRA_TRACKS];
-    int          n_extra       = 0;
-    const char  *kf_track_name = NULL;
-    bool         track_set     = false;
+    bool     insecure_skip_verify   = false;
+    bool     has_catalog_keepalive  = false;
+    uint64_t catalog_keepalive_ms   = 0;
+    uint32_t queue_objects          = 0;
+    uint64_t stats_interval_us      = 0;
+
+    source_t *cur_src = NULL;
+    track_t  *cur_trk = NULL;
 
     for (int i = 3; i < argc; i++) {
-        if (strcmp(argv[i], "--insecure-skip-verify") == 0)
+        const char *a = argv[i];
+
+        if (strcmp(a, "--insecure-skip-verify") == 0) {
             insecure_skip_verify = true;
-        else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc)
-            fps = (uint32_t)strtoul(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc)
-            width = (uint32_t)strtoul(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc)
-            height = (uint32_t)strtoul(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--framerate") == 0 && i + 1 < argc)
-            framerate = (uint32_t)strtoul(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc)
-            bitrate = (uint64_t)strtoull(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--catalog-keepalive-ms") == 0 && i + 1 < argc) {
-            catalog_keepalive_ms = (uint64_t)strtoull(argv[++i], NULL, 10);
-            has_catalog_keepalive_ms = true;
-        }
-        else if (strcmp(argv[i], "--pipe") == 0 && i + 6 < argc) {
-            if (n_extra < MAX_EXTRA_TRACKS) {
-                extra_defs[n_extra].name    = argv[i + 1];
-                extra_defs[n_extra].path    = argv[i + 2];
-                extra_defs[n_extra].width   = (uint32_t)strtoul (argv[i + 3], NULL, 10);
-                extra_defs[n_extra].height  = (uint32_t)strtoul (argv[i + 4], NULL, 10);
-                extra_defs[n_extra].fps     = (uint32_t)strtoul (argv[i + 5], NULL, 10);
-                extra_defs[n_extra].bitrate = (uint64_t)strtoull(argv[i + 6], NULL, 10);
-                n_extra++;
-                i += 6;
+        } else if (strcmp(a, "--catalog-keepalive-ms") == 0) {
+            catalog_keepalive_ms = strtoull(need_arg(argc, argv, &i, a), NULL, 10);
+            has_catalog_keepalive = true;
+        } else if (strcmp(a, "--ffmpeg") == 0) {
+            app.ffmpeg_bin = need_arg(argc, argv, &i, a);
+        } else if (strcmp(a, "--queue-objects") == 0) {
+            queue_objects = (uint32_t)strtoul(need_arg(argc, argv, &i, a), NULL, 10);
+        } else if (strcmp(a, "--stats-ms") == 0) {
+            stats_interval_us = strtoull(need_arg(argc, argv, &i, a), NULL, 10) * 1000ull;
+        } else if (strcmp(a, "--source") == 0) {
+            if (app.n_sources >= MAX_SOURCES) {
+                fprintf(stderr, "too many sources (max %d)\n", MAX_SOURCES);
+                return 2;
             }
-        }
-        else if (strcmp(argv[i], "--keyframe-track") == 0 && i + 1 < argc)
-            kf_track_name = argv[++i];
-        else if (argv[i][0] == '-' && argv[i][1] == '-') {
-            fprintf(stderr, "unknown option: %s\n", argv[i]);
-            return 2;
-        } else if (!track_set) {
-            track = argv[i];
-            track_set = true;
+            cur_src = &app.sources[app.n_sources++];
+            cur_src->name    = need_arg(argc, argv, &i, a);
+            cur_src->input   = SRC_INPUT_SPAWN;
+            cur_src->idle_us = DEFAULT_IDLE_US;
+            cur_src->app     = &app;
+            cur_src->read_fd = -1;
+            cur_src->pid     = -1;
+            cur_trk = NULL;
+        } else if (strcmp(a, "--track") == 0) {
+            if (app.n_tracks >= MAX_TRACKS) {
+                fprintf(stderr, "too many tracks (max %d)\n", MAX_TRACKS);
+                return 2;
+            }
+            cur_trk = &app.tracks[app.n_tracks++];
+            cur_trk->name    = need_arg(argc, argv, &i, a);
+            cur_trk->fps     = 30;
+            cur_trk->bitrate = 1500000;
+        } else if (strcmp(a, "--rtsp") == 0 || strcmp(a, "--fifo") == 0 ||
+                   strcmp(a, "--stdin") == 0 || strcmp(a, "--idle-ms") == 0 ||
+                   strcmp(a, "--always-on") == 0 || strcmp(a, "--warm-with") == 0) {
+            if (!cur_src) {
+                fprintf(stderr, "%s must follow a --source\n", a);
+                return 2;
+            }
+            if (strcmp(a, "--rtsp") == 0) {
+                cur_src->rtsp_url = need_arg(argc, argv, &i, a);
+                cur_src->input = SRC_INPUT_SPAWN;
+            } else if (strcmp(a, "--fifo") == 0) {
+                cur_src->fifo_path = need_arg(argc, argv, &i, a);
+                cur_src->input = SRC_INPUT_FIFO;
+                cur_src->always_on = true;   /* an external writer sets the pace */
+            } else if (strcmp(a, "--stdin") == 0) {
+                cur_src->input = SRC_INPUT_STDIN;
+                cur_src->always_on = true;
+            } else if (strcmp(a, "--idle-ms") == 0) {
+                cur_src->idle_us = strtoull(need_arg(argc, argv, &i, a), NULL, 10) * 1000ull;
+            } else if (strcmp(a, "--always-on") == 0) {
+                cur_src->always_on = true;
+            } else {
+                cur_src->warm_with = need_arg(argc, argv, &i, a);
+            }
+        } else if (strcmp(a, "--from") == 0 || strcmp(a, "--width") == 0 ||
+                   strcmp(a, "--height") == 0 || strcmp(a, "--fps") == 0 ||
+                   strcmp(a, "--bitrate") == 0 || strcmp(a, "--keyframes-only") == 0) {
+            if (!cur_trk) {
+                fprintf(stderr, "%s must follow a --track\n", a);
+                return 2;
+            }
+            if (strcmp(a, "--from") == 0)
+                cur_trk->from = need_arg(argc, argv, &i, a);
+            else if (strcmp(a, "--width") == 0)
+                cur_trk->width = (uint32_t)strtoul(need_arg(argc, argv, &i, a), NULL, 10);
+            else if (strcmp(a, "--height") == 0)
+                cur_trk->height = (uint32_t)strtoul(need_arg(argc, argv, &i, a), NULL, 10);
+            else if (strcmp(a, "--fps") == 0)
+                cur_trk->fps = (uint32_t)strtoul(need_arg(argc, argv, &i, a), NULL, 10);
+            else if (strcmp(a, "--bitrate") == 0)
+                cur_trk->bitrate = strtoull(need_arg(argc, argv, &i, a), NULL, 10);
+            else
+                cur_trk->keyframes_only = true;
         } else {
-            fprintf(stderr, "unexpected positional arg: %s\n", argv[i]);
+            fprintf(stderr, "unknown option: %s\n", a);
+            usage(argv[0]);
             return 2;
         }
     }
 
-    if (fps == 0)
-        fps = 30;
+    if (app.n_sources == 0 || app.n_tracks == 0) {
+        fprintf(stderr, "at least one --source and one --track are required\n");
+        usage(argv[0]);
+        return 2;
+    }
+
+    /* Resolve track -> source bindings and validate each source. */
+    for (int i = 0; i < app.n_tracks; i++) {
+        track_t *t = &app.tracks[i];
+        source_t *s = t->from ? find_source(&app, t->from) : &app.sources[0];
+        if (!s) {
+            fprintf(stderr, "track '%s': unknown source '%s'\n", t->name, t->from);
+            return 2;
+        }
+        if (s->n_tracks >= MAX_TRACKS) {
+            fprintf(stderr, "source '%s': too many tracks\n", s->name);
+            return 2;
+        }
+        t->src = s;
+        s->tracks[s->n_tracks++] = t;
+    }
+    for (int i = 0; i < app.n_sources; i++) {
+        source_t *s = &app.sources[i];
+        if (s->n_tracks == 0) {
+            fprintf(stderr, "source '%s': no tracks bound to it\n", s->name);
+            return 2;
+        }
+        if (s->input == SRC_INPUT_SPAWN && !s->rtsp_url) {
+            fprintf(stderr, "source '%s': needs --rtsp, --fifo or --stdin\n", s->name);
+            return 2;
+        }
+        if (s->warm_with && !find_source(&app, s->warm_with)) {
+            fprintf(stderr, "source '%s': unknown --warm-with '%s'\n",
+                    s->name, s->warm_with);
+            return 2;
+        }
+    }
 
     signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGPIPE, SIG_IGN);   /* a dying ffmpeg must not kill the publisher */
 
     moq_endpoint_cfg_t ec;
     moq_endpoint_cfg_init(&ec);
@@ -572,13 +1156,35 @@ int main(int argc, char **argv)
     scfg.endpoint = NULL;
     scfg.namespace_.parts = ns_parts;
     scfg.namespace_.count = ns_count;
-    if (has_catalog_keepalive_ms) {
+    if (has_catalog_keepalive) {
         scfg.catalog_refresh_interval_us =
             catalog_keepalive_ms == 0 ? UINT64_MAX : (catalog_keepalive_ms * 1000ull);
     }
 
-    moq_media_sender_t *tx = NULL;
-    rc = moq_media_sender_attach(ep, &scfg, &tx);
+    /* The send queue is one ring shared by every track and drained in strict
+     * order, so its object bound is the latency floor: a full ring costs
+     * queue_max_objects / (total objects per second) of delay. Default to
+     * QUEUE_SECONDS worth of the configured object rate. */
+    if (queue_objects == 0) {
+        uint32_t obj_per_sec = 0;
+        for (int i = 0; i < app.n_tracks; i++)
+            obj_per_sec += app.tracks[i].keyframes_only ? 1 : app.tracks[i].fps;
+        queue_objects = obj_per_sec * QUEUE_SECONDS;
+        if (queue_objects < QUEUE_MIN_OBJECTS)
+            queue_objects = QUEUE_MIN_OBJECTS;
+    }
+    scfg.queue_max_objects = queue_objects;
+
+    /* Without this, an object queued for a track with no subscriber holds the
+     * head of the shared ring and blocks every other track behind it. */
+    scfg.drop_without_demand = true;
+
+    moq_media_sender_callbacks_init_sized(&scfg.callbacks, sizeof(scfg.callbacks));
+    scfg.callbacks.ctx = &app;
+    scfg.callbacks.on_subscriber_joined = on_subscriber_joined;
+    scfg.callbacks.on_subscriber_left = on_subscriber_left;
+
+    rc = moq_media_sender_attach(ep, &scfg, &app.tx);
     if (rc != MOQ_OK) {
         fprintf(stderr, "sender attach failed: %d\n", (int)rc);
         moq_endpoint_stop(ep);
@@ -586,198 +1192,72 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    moq_media_track_cfg_t tc;
-    moq_media_track_cfg_init(&tc);
-    tc.name.data = (const uint8_t *)track;
-    tc.name.len = strlen(track);
-    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
-    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
-    tc.codec.data = (const uint8_t *)"avc1.42e01e";
-    tc.codec.len = 11;
-    tc.bitrate = bitrate;
-    tc.width = width;
-    tc.height = height;
-    tc.framerate_millis = (uint64_t)(framerate ? framerate : fps) * 1000u;
-    tc.is_live = true;
+    for (int i = 0; i < app.n_tracks; i++) {
+        track_t *t = &app.tracks[i];
+        moq_media_track_cfg_t tc;
+        moq_media_track_cfg_init(&tc);
+        tc.name.data        = (const uint8_t *)t->name;
+        tc.name.len         = strlen(t->name);
+        tc.media_type       = MOQ_MEDIA_TYPE_VIDEO;
+        tc.packaging        = MOQ_MEDIA_PACKAGING_RAW;
+        tc.codec.data       = (const uint8_t *)"avc1.42e01e";
+        tc.codec.len        = 11;
+        tc.bitrate          = t->bitrate;
+        tc.width            = t->width;
+        tc.height           = t->height;
+        tc.framerate_millis = t->keyframes_only ? 0 : (uint64_t)t->fps * 1000u;
+        tc.is_live          = true;
 
-    moq_media_track_t *trk = NULL;
-    rc = moq_media_sender_add_track(tx, &tc, &trk);
-    if (rc != MOQ_OK) {
-        fprintf(stderr, "add_track failed: %d\n", (int)rc);
-        moq_media_sender_destroy(tx);
-        moq_endpoint_stop(ep);
-        moq_endpoint_destroy(ep);
-        return 1;
-    }
-
-    fprintf(stderr, "annex-b stdin ingest enabled (fps=%u)\n", fps);
-
-    /* ── Extra pipe tracks ──────────────────────────────────────────── */
-
-    pipe_track_t pipe_tracks[MAX_EXTRA_TRACKS];
-    pthread_t    threads[MAX_EXTRA_TRACKS];
-    int          n_threads = 0;
-
-    for (int e = 0; e < n_extra; e++) {
-        moq_media_track_cfg_t etc;
-        moq_media_track_cfg_init(&etc);
-        etc.name.data        = (const uint8_t *)extra_defs[e].name;
-        etc.name.len         = strlen(extra_defs[e].name);
-        etc.media_type       = MOQ_MEDIA_TYPE_VIDEO;
-        etc.packaging        = MOQ_MEDIA_PACKAGING_RAW;
-        etc.codec.data       = (const uint8_t *)"avc1.42e01e";
-        etc.codec.len        = 11;
-        etc.bitrate          = extra_defs[e].bitrate ? extra_defs[e].bitrate : bitrate;
-        etc.width            = extra_defs[e].width;
-        etc.height           = extra_defs[e].height;
-        uint32_t efps        = extra_defs[e].fps ? extra_defs[e].fps : fps;
-        etc.framerate_millis = (uint64_t)efps * 1000u;
-        etc.is_live          = true;
-
-        moq_media_track_t *etrk = NULL;
-        rc = moq_media_sender_add_track(tx, &etc, &etrk);
+        rc = moq_media_sender_add_track(app.tx, &tc, &t->handle);
         if (rc != MOQ_OK) {
-            fprintf(stderr, "add_track '%s' failed: %d\n", extra_defs[e].name, (int)rc);
-            moq_media_sender_destroy(tx);
+            fprintf(stderr, "add_track '%s' failed: %d\n", t->name, (int)rc);
+            moq_media_sender_destroy(app.tx);
             moq_endpoint_stop(ep);
             moq_endpoint_destroy(ep);
             return 1;
         }
-
-        pipe_tracks[n_threads].tx    = tx;
-        pipe_tracks[n_threads].track = etrk;
-        pipe_tracks[n_threads].name  = extra_defs[e].name;
-        pipe_tracks[n_threads].path  = extra_defs[e].path;
-        pipe_tracks[n_threads].fps   = efps;
-        pthread_create(&threads[n_threads], NULL, pipe_track_reader,
-                       &pipe_tracks[n_threads]);
-        n_threads++;
-        fprintf(stderr, "track '%s': reader thread started (pipe: %s)\n",
-                extra_defs[e].name, extra_defs[e].path);
+        fprintf(stderr, "track '%s' <- source '%s'%s\n",
+                t->name, t->src->name, t->keyframes_only ? " (keyframes only)" : "");
     }
 
-    /* ── Keyframe sidecar track ─────────────────────────────────────── */
+    g_epoch_us = monotonic_time_us();
+    fprintf(stderr, "announced; send queue bound %u objects; waiting for subscribers\n",
+            queue_objects);
 
-    moq_media_track_t *kf_track = NULL;
-    if (kf_track_name) {
-        moq_media_track_cfg_t kftc;
-        moq_media_track_cfg_init(&kftc);
-        kftc.name.data        = (const uint8_t *)kf_track_name;
-        kftc.name.len         = strlen(kf_track_name);
-        kftc.media_type       = MOQ_MEDIA_TYPE_VIDEO;
-        kftc.packaging        = MOQ_MEDIA_PACKAGING_RAW;
-        kftc.codec.data       = (const uint8_t *)"avc1.42e01e";
-        kftc.codec.len        = 11;
-        kftc.bitrate          = bitrate;
-        kftc.width            = width;
-        kftc.height           = height;
-        kftc.framerate_millis = 0;   /* variable — keyframes only */
-        kftc.is_live          = true;
-        rc = moq_media_sender_add_track(tx, &kftc, &kf_track);
-        if (rc != MOQ_OK) {
-            fprintf(stderr, "add_track '%s' failed: %d\n", kf_track_name, (int)rc);
-            kf_track = NULL;
-        } else {
-            fprintf(stderr, "track '%s': keyframe sidecar active\n", kf_track_name);
-        }
-    }
-    const uint64_t frame_duration_us = 1000000ull / fps;
-    uint64_t frame_index = 0;
-    unsigned long long sent = 0;
-    bool started = false;
-
-    h264_annexb_reader_t reader;
-    h264_reader_init(&reader);
-    byte_vec_t au = {0};
+    uint64_t next_stats_us = stats_interval_us ? monotonic_time_us() + stats_interval_us : 0;
 
     while (!g_stop) {
-        bool keyframe = false;
-        if (!read_h264_access_unit(stdin, &reader, &au, &keyframe))
-            break;
-        if (au.len == 0)
-            continue;
-
-        if (!started) {
-            if (!keyframe)
-                continue;
-            started = true;
-            fprintf(stderr, "first keyframe detected; starting publish\n");
-        }
-
-        uint8_t *owned = (uint8_t *)malloc(au.len);
-        if (!owned)
-            break;
-        memcpy(owned, au.data, au.len);
-
-        moq_rcbuf_t *payload = NULL;
-        if (moq_rcbuf_wrap(moq_alloc_default(), owned, au.len,
-                           payload_release, NULL, &payload) != MOQ_OK) {
-            free(owned);
+        supervisor_tick(&app);
+        if (moq_media_sender_is_closed(app.tx) || moq_media_sender_is_fatal(app.tx)) {
+            fprintf(stderr, "sender terminal (fatal=%d code=0x%llx)\n",
+                    (int)moq_media_sender_is_fatal(app.tx),
+                    (unsigned long long)moq_media_sender_fatal_code(app.tx));
             break;
         }
-
-        moq_media_send_object_t o;
-        memset(&o, 0, sizeof(o));
-        o.struct_size = sizeof(o);
-        o.payload = payload;
-        o.is_sync = keyframe;
-        o.starts_group = keyframe;
-        o.presentation_time_us = frame_index * frame_duration_us;
-        o.decode_time_us = frame_index * frame_duration_us;
-        o.has_capture_time = true;
-        o.capture_time_us = realtime_time_us();
-
-        /* Keyframe sidecar: incref before the first write so the same
-           buffer can be handed to both tracks without an extra malloc. */
-        bool write_kf = (keyframe && kf_track != NULL);
-        if (write_kf)
-            moq_rcbuf_incref(payload);
-
-        moq_result_t wr = moq_media_sender_write(tx, trk, &o);
-        if (wr == MOQ_OK) {
-            sent++;
-            frame_index++;
-        } else if (wr == MOQ_ERR_WOULD_BLOCK) {
-            moq_rcbuf_decref(payload);
-            if (write_kf) { moq_rcbuf_decref(payload); write_kf = false; }
-        } else if (wr == MOQ_ERR_INTERRUPTED || wr == MOQ_ERR_CLOSED) {
-            moq_rcbuf_decref(payload);
-            if (write_kf) { moq_rcbuf_decref(payload); write_kf = false; }
-            break;
-        } else {
-            moq_rcbuf_decref(payload);
-            if (write_kf) { moq_rcbuf_decref(payload); write_kf = false; }
-            fprintf(stderr, "write failed: %d\n", (int)wr);
-            break;
+        if (next_stats_us && monotonic_time_us() >= next_stats_us) {
+            moq_media_sender_stats_t st;
+            memset(&st, 0, sizeof(st));
+            if (moq_media_sender_get_stats(app.tx, &st, sizeof(st)) == MOQ_OK) {
+                fprintf(stderr,
+                        "stats: queued=%llu/%u bytes_queued=%llu written=%llu sent=%llu "
+                        "dropped=%llu groups_dropped=%llu abandoned=%llu last_err=%d\n",
+                        (unsigned long long)st.objects_queued, queue_objects,
+                        (unsigned long long)st.bytes_queued,
+                        (unsigned long long)st.objects_written,
+                        (unsigned long long)st.objects_sent,
+                        (unsigned long long)st.objects_dropped,
+                        (unsigned long long)st.groups_dropped,
+                        (unsigned long long)st.groups_abandoned,
+                        (int)st.last_error);
+            }
+            next_stats_us = monotonic_time_us() + stats_interval_us;
         }
-
-        if (write_kf) {
-            moq_media_send_object_t kfo;
-            memset(&kfo, 0, sizeof(kfo));
-            kfo.struct_size          = sizeof(kfo);
-            kfo.payload              = payload;   /* ref held from incref above */
-            kfo.is_sync              = true;
-            kfo.starts_group         = true;
-            kfo.presentation_time_us = o.presentation_time_us;
-            kfo.decode_time_us       = o.decode_time_us;
-            kfo.has_capture_time     = true;
-            kfo.capture_time_us      = o.capture_time_us;
-            moq_result_t wkf = moq_media_sender_write(tx, kf_track, &kfo);
-            if (wkf != MOQ_OK)
-                moq_rcbuf_decref(payload);
-        }
+        usleep(SUPERVISOR_TICK_US);
     }
 
-    vec_free(&au);
-    h264_reader_free(&reader);
+    supervisor_shutdown(&app);
 
-    /* Join extra-track reader threads */
-    for (int i = 0; i < n_threads; i++)
-        pthread_join(threads[i], NULL);
-
-    fprintf(stderr, "wrote %llu objects\n", sent);
-
-    moq_media_sender_destroy(tx);
+    moq_media_sender_destroy(app.tx);
     drain_before_stop(ep);
     moq_endpoint_stop(ep);
     moq_endpoint_destroy(ep);
