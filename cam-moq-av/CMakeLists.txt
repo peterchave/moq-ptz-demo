@@ -39,9 +39,14 @@ set_target_properties(ptls::minicrypto PROPERTIES
 # picoquic
 add_library(picoquic::log  STATIC IMPORTED)
 add_library(picoquic::core STATIC IMPORTED)
+set(PICOQUIC_LOG_LINK_LIBRARIES "")
+if(UNIX AND NOT APPLE)
+    set(PICOQUIC_LOG_LINK_LIBRARIES "picoquic::core")
+endif()
 set_target_properties(picoquic::log PROPERTIES
     IMPORTED_LOCATION "${MOQ5_BUILD}/_deps/picoquic/libpicoquic-log.a"
-    INTERFACE_INCLUDE_DIRECTORIES "${MOQ5_ROOT}/thirdparty/picoquic/picoquic")
+    INTERFACE_INCLUDE_DIRECTORIES "${MOQ5_ROOT}/thirdparty/picoquic/picoquic"
+    INTERFACE_LINK_LIBRARIES "${PICOQUIC_LOG_LINK_LIBRARIES}")
 set_target_properties(picoquic::core PROPERTIES
     IMPORTED_LOCATION "${MOQ5_BUILD}/_deps/picoquic/libpicoquic-core.a"
     INTERFACE_INCLUDE_DIRECTORIES "${MOQ5_ROOT}/thirdparty/picoquic/picoquic"

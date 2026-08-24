@@ -231,8 +231,14 @@ async function waitForSubscriptionAlias(
     throw new Error(`Subscription ${requestId} did not receive trackAlias within ${timeoutMs}ms`);
 }
 
+let lastVideoLatencyMs: number | null = null;
+let lastDecodeQueue = 0;
+
 function updateStats(): void {
-    statsEl.textContent = `Video: ${frameCount} frames | Audio: ${audioSampleCount} chunks`;
+    const lat = lastVideoLatencyMs === null ? '--' : `${lastVideoLatencyMs.toFixed(0)}ms`;
+    statsEl.textContent =
+        `Video: ${frameCount} frames | Audio: ${audioSampleCount} chunks | ` +
+        `latency: ${lat} | decodeQ: ${lastDecodeQueue}`;
 }
 
 async function sendControlObject(payload: Uint8Array): Promise<void> {
@@ -1263,6 +1269,12 @@ function handleVideoObject(obj: MoqtObject): void {
 
     // ── Decode ─────────────────────────────────────────────────────
     if (videoDecoder && videoDecoder.state === 'configured') {
+        // Latency at ingress to the decoder; compared against decodeQueueSize
+        // this separates network delay from decode backlog.
+        if (headers.captureTimestamp !== undefined) {
+            lastVideoLatencyMs = Date.now() - Number(headers.captureTimestamp) / 1000;
+        }
+        lastDecodeQueue = videoDecoder.decodeQueueSize;
         videoDecoder.decode(new EncodedVideoChunk(chunkInit));
     }
 }

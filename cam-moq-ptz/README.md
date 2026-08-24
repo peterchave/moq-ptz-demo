@@ -1,4 +1,4 @@
-# moq2ptz
+# cam-moq-ptz
 
 Consumes PTZ commands from MOQT and sends camera movement commands over HTTP.
 

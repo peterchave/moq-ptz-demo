@@ -1,4 +1,4 @@
-# moq2ai
+# cam-moq-ai
 
 Streams camera frames into MOQT, runs YOLO detection, and publishes detection results for overlaying on the UI.
 
