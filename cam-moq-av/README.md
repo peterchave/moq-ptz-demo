@@ -1,4 +1,4 @@
-# vid2moq
+# cam-moq-av
 
 Publishes a camera RTSP video stream into MOQT, on demand.
 
